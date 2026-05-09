@@ -23,6 +23,7 @@ func RemoveOutputsFromOtherModels(agentDir string, keepModel entity.AgentModel) 
 	if keepModel != entity.ModelCodex && keepModel != entity.ModelQoder {
 		_ = os.Remove(filepath.Join(agentDir, "AGENTS.md"))
 		_ = os.RemoveAll(filepath.Join(agentDir, ".agencycli-skills"))
+		_ = os.RemoveAll(filepath.Join(agentDir, ".codex", "skills"))
 	}
 
 	if keepModel != entity.ModelGemini {
@@ -47,9 +48,11 @@ func RemoveOutputsFromOtherModels(agentDir string, keepModel entity.AgentModel) 
 		_ = os.Remove(filepath.Join(agentDir, "context.md"))
 	}
 
-	// Layer markdown under .agencycli/context is used by claudecode and gemini.
-	// Other runtimes ignore it but stale files confuse humans and http-agent fallbacks.
-	if keepModel != entity.ModelClaudeCode && keepModel != entity.ModelGemini {
+	// Layer markdown under .agencycli/context is used by claudecode, gemini,
+	// and codex/qoder. Codex still reads AGENTS.md as the primary context, but
+	// keeps these files as a Claude-style inspection and learning surface.
+	if keepModel != entity.ModelClaudeCode && keepModel != entity.ModelGemini &&
+		keepModel != entity.ModelCodex && keepModel != entity.ModelQoder {
 		ctxDir := filepath.Join(agentDir, ".agencycli", "context")
 		entries, err := os.ReadDir(ctxDir)
 		if err == nil {

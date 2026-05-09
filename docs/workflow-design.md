@@ -597,7 +597,7 @@ OKRs live in context, not in the task system. This is by design:
 
 - Project OKRs go in `projects/<project>/prompt.md` (a dedicated `## OKRs` section)
 - Agency-level OKRs go in `agency-prompt.md`
-- The PM agent and Project Director agent are responsible for keeping these up to date
+- The PM agent and Project Director agent are responsible for keeping these up to date, along with related project knowledge, docs, and skills
 - `agencycli sync` propagates changes to all agent working directories
 
 **Weekly PM agent cron** includes a step:

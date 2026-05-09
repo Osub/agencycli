@@ -42,6 +42,7 @@ func newMilestoneListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			project = defaultProjectScope(root, project)
 			if project == "" {
 				return fmt.Errorf("--project is required")
 			}

@@ -97,6 +97,7 @@ func runRunsSummary(since, until string, allTime bool, project string) error {
 	if err != nil {
 		return err
 	}
+	rows = telemetry.HydrateRunRows(root, rows)
 	sum := telemetry.Summarize(rows)
 
 	s := store.NewFS(root)
@@ -109,7 +110,7 @@ func runRunsSummary(since, until string, allTime bool, project string) error {
 	fmt.Println(boxTop(ag.Name+" · run telemetry", right))
 	fmt.Println(boxBlank())
 	fmt.Println(secHeader("WINDOW"))
-	fmt.Println(boxRow(silver("  "+right)))
+	fmt.Println(boxRow(silver("  " + right)))
 	fmt.Println(boxBlank())
 
 	if sum.Runs == 0 {
@@ -125,7 +126,7 @@ func runRunsSummary(since, until string, allTime bool, project string) error {
 		col(ansiCyan, fmt.Sprintf("%d", sum.TaskRuns)),
 		col(ansiMagenta, fmt.Sprintf("%d", sum.ExecRuns)),
 	)))
-	fmt.Println(boxRow(silver("  wall time (sum of run spans)  "+formatDurationHuman(sum.WallDuration))))
+	fmt.Println(boxRow(silver("  wall time (sum of run spans)  " + formatDurationHuman(sum.WallDuration))))
 	fmt.Println(boxBlank())
 
 	fmt.Println(secHeader("TOKENS (aggregated)"))
@@ -136,7 +137,7 @@ func runRunsSummary(since, until string, allTime bool, project string) error {
 	)))
 	fmt.Println(boxBlank())
 
-	costLine := fmt.Sprintf("  %s  reported API total  (%s runs with usage block)",
+	costLine := fmt.Sprintf("  %s  reported/estimated total  (%s runs with cost)",
 		col(ansiBYellow, fmt.Sprintf("$%.4f", sum.CostUSD)),
 		col(ansiWhite, fmt.Sprintf("%d", sum.RunsWithCost)),
 	)
@@ -178,6 +179,7 @@ func runRunsAgents(since, until string, allTime bool, project string) error {
 	if err != nil {
 		return err
 	}
+	rows = telemetry.HydrateRunRows(root, rows)
 	bySlice := telemetry.SummarizeByAgent(rows)
 	stats := make(map[string]telemetry.AgentSummary, len(bySlice))
 	for _, a := range bySlice {

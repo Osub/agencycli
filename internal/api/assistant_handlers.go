@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/chenhg5/agencycli/internal/runtimeenv"
 )
 
 // assistantSession tracks an in-flight interactive claude process so the
@@ -133,7 +135,7 @@ func (s *Server) assistantJSON(w http.ResponseWriter, ctx context.Context, promp
 	}
 	cmd := exec.CommandContext(ctx, cliPath, args...)
 	cmd.Dir = s.root
-	cmd.Env = os.Environ()
+	cmd.Env = s.assistantEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil && len(out) == 0 {
@@ -166,7 +168,7 @@ func (s *Server) assistantStream(w http.ResponseWriter, ctx context.Context, pro
 	// Fallback: one-shot streaming for other CLIs (codex, gemini).
 	cmd := exec.CommandContext(ctx, cliPath, cliArgs...)
 	cmd.Dir = s.root
-	cmd.Env = os.Environ()
+	cmd.Env = s.assistantEnv()
 	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
@@ -235,7 +237,7 @@ func (s *Server) assistantStreamClaude(w http.ResponseWriter, ctx context.Contex
 
 	cmd := exec.CommandContext(ctx, cliPath, args...)
 	cmd.Dir = s.root
-	cmd.Env = os.Environ()
+	cmd.Env = s.assistantEnv()
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -428,6 +430,10 @@ func (s *Server) resolveAssistantCLI() (string, []string) {
 	return "", nil
 }
 
+func (s *Server) assistantEnv() []string {
+	return runtimeenv.WithAgencycliEnv(os.Environ(), s.root)
+}
+
 func (s *Server) loadAssistantSkill() string {
 	candidates := []string{
 		filepath.Join(s.root, "SKILL.md"),
@@ -460,7 +466,11 @@ Key commands:
 - agencycli milestone list/create/show/update/delete - Manage milestones
 
 Always use --dir flag pointing to the agency workspace root when running commands.
-Run 'agencycli --help' for full command reference.
+The runtime sets AGENCYCLI_BIN. Prefer "$AGENCYCLI_BIN" --dir <workspace> ... over bare agencycli when running shell commands.
+Run "$AGENCYCLI_BIN" --help for full command reference.
+
+Tooling notes:
+- Foundry/forge: do not repeat single-use flags such as --match-contract. Combine multiple contracts into one regex, for example --match-contract '(A|B)', or run separate forge test commands.
 `
 
 func (s *Server) buildAssistantPromptWithGoals(skill, root string, history []assistantChatMsg, message string) string {
@@ -473,7 +483,11 @@ func buildAssistantPrompt(skill, root, goalSummary string, history []assistantCh
 
 	sb.WriteString(skill)
 	sb.WriteString("\n\n---\n\n")
-	sb.WriteString(fmt.Sprintf("## Environment\n\nAgency workspace: `%s`\nAlways use `--dir %s` when running agencycli commands.\n\n", root, root))
+	agencycliBin := runtimeenv.AgencycliBinaryPath(root, os.Environ())
+	if agencycliBin == "" {
+		agencycliBin = "agencycli"
+	}
+	sb.WriteString(fmt.Sprintf("## Environment\n\nAgency workspace: `%s`\nAgencyCLI binary: `%s`\nThe shell environment sets `AGENCYCLI_BIN`; prefer `\"$AGENCYCLI_BIN\" --dir %s ...` over bare `agencycli`.\nAlways use `--dir %s` when running agencycli commands.\n\n", root, agencycliBin, root, root))
 
 	if goalSummary != "" {
 		sb.WriteString("## Current Goals & OKRs\n\n")
@@ -488,6 +502,7 @@ func buildAssistantPrompt(skill, root, goalSummary string, history []assistantCh
 	sb.WriteString("You are aware of the agency's OKRs and milestones — reference them when relevant. ")
 	sb.WriteString("When the user asks about goals, progress, or what to focus on, consult the Current Goals section. ")
 	sb.WriteString("Always explain what you're doing and show the results. ")
+	sb.WriteString("When using Foundry/forge, do not repeat single-use flags such as --match-contract; combine alternatives into one regex like --match-contract '(A|B)' or run separate commands. ")
 	sb.WriteString("Respond concisely in the same language as the user's message.\n\n")
 
 	if len(history) > 0 {
