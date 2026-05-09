@@ -16,6 +16,15 @@ coverage.html
 # Dependency vendor directory (if not vendoring)
 vendor/
 
+# Local Go caches used by Codex/agent runs
+.gocache/
+.gomodcache/
+.gopath/
+
+# Local agency/demo workspaces kept outside source control
+DemoAgency/
+gpt88-docs-site/
+
 # Go workspace file
 go.work
 go.work.sum
