@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -95,13 +96,13 @@ func newTaskAddCmd() *cobra.Command {
 				return fmt.Errorf("--prompt or --prompt-file is required")
 			}
 
-		if assignee == "" {
-			if agentName == "human" {
-				assignee = "human"
-			} else {
-				assignee = project + "/" + agentName
+			if assignee == "" {
+				if agentName == "human" {
+					assignee = "human"
+				} else {
+					assignee = project + "/" + agentName
+				}
 			}
-		}
 
 			if !cmd.Flags().Changed("created-by") {
 				return fmt.Errorf("--created-by is required\n\n" +
@@ -213,6 +214,7 @@ func newTaskListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			project, agentName = defaultAgentScope(root, project, agentName)
 			if project == "" || agentName == "" {
 				return fmt.Errorf("--project and --agent are required")
 			}
@@ -284,29 +286,116 @@ func newTaskListCmd() *cobra.Command {
 	return cmd
 }
 
+func defaultAgentScopedFlag(value, envName string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv(envName))
+}
+
+func defaultAgentScope(root, project, agentName string) (string, string) {
+	project = defaultAgentScopedFlag(project, "AGENCYCLI_PROJECT")
+	agentName = defaultAgentScopedFlag(agentName, "AGENCYCLI_AGENT")
+	if project != "" && agentName != "" {
+		return project, agentName
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return project, agentName
+	}
+	if inferredProject, inferredAgent, ok := inferAgentScopeFromPath(root, cwd); ok {
+		if project == "" {
+			project = inferredProject
+		}
+		if agentName == "" {
+			agentName = inferredAgent
+		}
+	}
+	return project, agentName
+}
+
+func defaultProjectScope(root, project string) string {
+	project = defaultAgentScopedFlag(project, "AGENCYCLI_PROJECT")
+	if project != "" {
+		return project
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return project
+	}
+	if inferredProject, _, ok := inferAgentScopeFromPath(root, cwd); ok {
+		return inferredProject
+	}
+	return project
+}
+
+func inferAgentScopeFromPath(root, path string) (project, agent string, ok bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return "", "", false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i := 0; i+3 < len(parts); i++ {
+		if parts[i] == "projects" && parts[i+2] == "agents" && parts[i+1] != "" && parts[i+3] != "" {
+			return parts[i+1], parts[i+3], true
+		}
+	}
+	return "", "", false
+}
+
 // ── task show ─────────────────────────────────────────────────────────────────
 
 func newTaskShowCmd() *cobra.Command {
 	var (
 		project   string
 		agentName string
+		taskID    string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "show <task-id>",
+		Use:   "show [task-id]",
 		Short: "Show full detail of a task",
-		Args:  cobra.ExactArgs(1),
+		Long: `Show full detail of a task.
+
+If --project or --agent is omitted, AgencyCli searches the workspace for the
+task ID and resolves its owner automatically.`,
+		Example: `  agencycli task show t-20260508-0rwnju
+  agencycli task show t-20260508-0rwnju --project bnb-rise-launchpad
+  agencycli task show t-20260508-0rwnju --project bnb-rise-launchpad --agent dev`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) > 1 {
+				return fmt.Errorf("accepts at most 1 arg, received %d", len(args))
+			}
+			if len(args) == 0 && strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("task id is required")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			root, err := resolveRoot()
 			if err != nil {
 				return err
 			}
+			if len(args) > 0 {
+				taskID = args[0]
+			}
+			taskID = strings.TrimSpace(taskID)
 			if project == "" || agentName == "" {
-				return fmt.Errorf("--project and --agent are required")
+				resolvedProject, resolvedAgent, err := resolveTaskOwner(root, taskID)
+				if err != nil {
+					return err
+				}
+				if project != "" && project != resolvedProject {
+					return fmt.Errorf("task %q belongs to project %q/agent %q, not project %q", taskID, resolvedProject, resolvedAgent, project)
+				}
+				if agentName != "" && agentName != resolvedAgent {
+					return fmt.Errorf("task %q belongs to project %q/agent %q, not agent %q", taskID, resolvedProject, resolvedAgent, agentName)
+				}
+				project, agentName = resolvedProject, resolvedAgent
 			}
 
 			ts := taskstore.New(root)
-			t, err := ts.GetTask(project, agentName, args[0])
+			t, err := ts.GetTask(project, agentName, taskID)
 			if err != nil {
 				return err
 			}
@@ -358,8 +447,9 @@ func newTaskShowCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&project, "project", "", "project name")
-	cmd.Flags().StringVar(&agentName, "agent", "", "agent name")
+	cmd.Flags().StringVar(&project, "project", "", "project name (optional; auto-discovered when omitted)")
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent name (optional; auto-discovered when omitted)")
+	cmd.Flags().StringVar(&taskID, "id", "", "task ID (alternative to positional arg)")
 	return cmd
 }
 
@@ -838,10 +928,10 @@ func resolveStores(root string) (taskstore.Store, store.Store) {
 
 func newTaskStopAllCmd() *cobra.Command {
 	var (
-		project    string
-		agentName  string
-		allAgents  bool
-		noPending  bool
+		project   string
+		agentName string
+		allAgents bool
+		noPending bool
 	)
 
 	cmd := &cobra.Command{
@@ -944,11 +1034,14 @@ Use --no-pending to skip pending tasks and only cancel in-progress ones.`,
 
 // tokenUsage holds token counts from a single run log.
 type tokenUsage struct {
-	InputTokens       int64
-	OutputTokens      int64
-	CacheReadTokens   int64
-	TotalCostUSD      float64
-	HasCost           bool // true when total_cost_usd came from the log
+	InputTokens     int64
+	OutputTokens    int64
+	CacheReadTokens int64
+	TotalCostUSD    float64
+	HasCost         bool
+	EstimatedCost   bool
+	TotalOnly       bool
+	Model           string
 }
 
 func newTaskTokensCmd() *cobra.Command {
@@ -962,10 +1055,11 @@ func newTaskTokensCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "tokens",
 		Short: "Show token usage and estimated cost from run logs",
-		Long: `Parses Claude stream-json run logs and aggregates input/output token counts.
-Cost is estimated using Anthropic's Claude pricing (configurable via env):
-  ANTHROPIC_INPUT_PRICE_PER_M  (default: 3.0  USD per 1M input tokens)
-  ANTHROPIC_OUTPUT_PRICE_PER_M (default: 15.0 USD per 1M output tokens)`,
+		Long: `Parses agent run logs and aggregates token usage.
+
+For Codex, agencycli reads the persisted Codex session JSONL when available,
+falling back to the text "tokens used" footer. Cost is shown when the API
+reported it or when pricing is configured under Settings → API Providers.`,
 		Example: `  # Tokens for a specific task
   agencycli task tokens --project cc-connect --agent pm --task t-20260317-18omal
 
@@ -986,9 +1080,6 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 			allAgentsFlag, _ := cmd.Flags().GetBool("all-agents")
 
 			ts := taskstore.New(root)
-
-			inputPrice := getEnvFloat("ANTHROPIC_INPUT_PRICE_PER_M", 3.0)
-			outputPrice := getEnvFloat("ANTHROPIC_OUTPUT_PRICE_PER_M", 15.0)
 
 			var agentList []string
 			if allAgentsFlag {
@@ -1034,7 +1125,7 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 						continue
 					}
 
-					u, err := parseLogTokens(logDir + "/" + e.Name())
+					u, err := parseLogTokens(root, logDir+"/"+e.Name())
 					if err != nil {
 						continue
 					}
@@ -1049,10 +1140,7 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 					taskCount++
 
 					if taskID != "" || allTasks {
-						costStr := fmt.Sprintf("$%.4f", u.TotalCostUSD)
-						if !u.HasCost {
-							costStr = fmt.Sprintf("~$%.4f", calcCost(u.InputTokens, u.OutputTokens, inputPrice, outputPrice))
-						}
+						costStr := formatUsageCost(u)
 						fmt.Printf("  %-44s  in=%7s  out=%6s  cache=%6s  %s\n",
 							e.Name(),
 							formatTokens(u.InputTokens),
@@ -1063,25 +1151,20 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 					}
 				}
 
-			summaries = append(summaries, agentSummary{ag, agUsage, taskCount})
-			grandTotal.InputTokens += agUsage.InputTokens
-			grandTotal.OutputTokens += agUsage.OutputTokens
-			grandTotal.CacheReadTokens += agUsage.CacheReadTokens
-			grandTotal.TotalCostUSD += agUsage.TotalCostUSD
-			grandTotal.HasCost = grandTotal.HasCost || agUsage.HasCost
-		}
+				summaries = append(summaries, agentSummary{ag, agUsage, taskCount})
+				grandTotal.InputTokens += agUsage.InputTokens
+				grandTotal.OutputTokens += agUsage.OutputTokens
+				grandTotal.CacheReadTokens += agUsage.CacheReadTokens
+				grandTotal.TotalCostUSD += agUsage.TotalCostUSD
+				grandTotal.HasCost = grandTotal.HasCost || agUsage.HasCost
+			}
 
 			fmt.Println()
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(w, "AGENT\tTASKS\tINPUT\tOUTPUT\tCACHE HIT\tCOST")
 			fmt.Fprintln(w, "─────\t─────\t─────\t──────\t─────────\t────")
 			for _, s := range summaries {
-				var costStr string
-				if s.usage.HasCost {
-					costStr = fmt.Sprintf("$%.4f", s.usage.TotalCostUSD)
-				} else {
-					costStr = fmt.Sprintf("~$%.4f", calcCost(s.usage.InputTokens, s.usage.OutputTokens, inputPrice, outputPrice))
-				}
+				costStr := formatUsageCost(s.usage)
 				fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n",
 					s.name, s.tasks,
 					formatTokens(s.usage.InputTokens),
@@ -1091,12 +1174,7 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 				)
 			}
 			if len(summaries) > 1 {
-				var totalCostStr string
-				if grandTotal.HasCost {
-					totalCostStr = fmt.Sprintf("$%.4f", grandTotal.TotalCostUSD)
-				} else {
-					totalCostStr = fmt.Sprintf("~$%.4f", calcCost(grandTotal.InputTokens, grandTotal.OutputTokens, inputPrice, outputPrice))
-				}
+				totalCostStr := formatUsageCost(grandTotal)
 				fmt.Fprintln(w, "─────\t─────\t─────\t──────\t─────────\t────")
 				fmt.Fprintf(w, "TOTAL\t-\t%s\t%s\t%s\t%s\n",
 					formatTokens(grandTotal.InputTokens),
@@ -1107,8 +1185,7 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 			}
 			w.Flush()
 			if !grandTotal.HasCost {
-				fmt.Printf("\nEstimated pricing: $%.2f/M input, $%.2f/M output\n(override with ANTHROPIC_INPUT_PRICE_PER_M / ANTHROPIC_OUTPUT_PRICE_PER_M)\n",
-					inputPrice, outputPrice)
+				fmt.Println("\nCost unavailable: configure pricing in Settings → API Providers, or provide AGENCYCLI_PRICE_*_PER_M env vars.")
 			}
 			return nil
 		},
@@ -1125,23 +1202,40 @@ Cost is estimated using Anthropic's Claude pricing (configurable via env):
 
 // ── token helpers ─────────────────────────────────────────────────────────────
 
-func parseLogTokens(path string) (tokenUsage, error) {
+func parseLogTokens(root, path string) (tokenUsage, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return tokenUsage{}, err
 	}
-	u := telemetry.ParseStreamJSONUsage(data)
-	return tokenUsage{
+	u := telemetry.ParseLogUsage(data)
+	model := telemetry.ModelFromLog(data)
+	out := tokenUsage{
 		InputTokens:     u.InputTokens,
 		OutputTokens:    u.OutputTokens,
 		CacheReadTokens: u.CacheReadTokens,
 		TotalCostUSD:    u.TotalCostUSD,
-		HasCost:         u.SawResult,
-	}, nil
+		HasCost:         u.HasCost,
+		TotalOnly:       u.TotalOnly,
+		Model:           model,
+	}
+	if !out.HasCost && u.SawResult {
+		if cost, ok := telemetry.EstimateCostUSDForRoot(root, model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.TotalOnly); ok {
+			out.TotalCostUSD = cost
+			out.HasCost = true
+			out.EstimatedCost = true
+		}
+	}
+	return out, nil
 }
 
-func calcCost(in, out int64, inPricePerM, outPricePerM float64) float64 {
-	return float64(in)/1e6*inPricePerM + float64(out)/1e6*outPricePerM
+func formatUsageCost(u tokenUsage) string {
+	if !u.HasCost {
+		return "—"
+	}
+	if u.EstimatedCost {
+		return fmt.Sprintf("~$%.4f", u.TotalCostUSD)
+	}
+	return fmt.Sprintf("$%.4f", u.TotalCostUSD)
 }
 
 func formatTokens(n int64) string {

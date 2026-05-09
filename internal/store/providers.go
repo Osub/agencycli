@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/chenhg5/agencycli/internal/entity"
 	"gopkg.in/yaml.v3"
@@ -174,5 +175,39 @@ func (ps *ProviderStore) ResolveEnv(id string) (map[string]string, error) {
 			env["GOOGLE_API_BASE"] = p.BaseURL
 		}
 	}
+	addPricingEnv(env, p.Model, p.Pricing)
 	return env, nil
+}
+
+func addPricingEnv(env map[string]string, model string, p entity.ProviderPricing) {
+	set := func(name string, value float64) {
+		if value <= 0 {
+			return
+		}
+		env["AGENCYCLI_PRICE_"+name+"_PER_M"] = strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.8f", value), "0"), ".")
+		if suffix := providerPriceModelSuffix(model); suffix != "" {
+			env["AGENCYCLI_PRICE_"+suffix+"_"+name+"_PER_M"] = env["AGENCYCLI_PRICE_"+name+"_PER_M"]
+		}
+	}
+	set("INPUT", p.InputPerM)
+	set("CACHED_INPUT", p.CachedInputPerM)
+	set("OUTPUT", p.OutputPerM)
+	set("TOTAL", p.TotalPerM)
+}
+
+func providerPriceModelSuffix(model string) string {
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range strings.ToUpper(strings.TrimSpace(model)) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
 }

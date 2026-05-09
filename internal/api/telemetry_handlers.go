@@ -45,6 +45,7 @@ func (s *Server) handleTelemetrySummary(w http.ResponseWriter, r *http.Request) 
 		s.serverError(w, err)
 		return
 	}
+	rows = telemetry.HydrateRunRows(s.root, rows)
 	sum := telemetry.Summarize(rows)
 	byAgent := telemetry.SummarizeByAgent(rows)
 
@@ -148,6 +149,7 @@ func (s *Server) handleTelemetryRuns(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
+	rows = telemetry.HydrateRunRows(s.root, rows)
 	// Newest first
 	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
 		rows[i], rows[j] = rows[j], rows[i]
@@ -180,6 +182,9 @@ func (s *Server) handleTelemetryRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		if row.ErrorMsg.Valid && row.ErrorMsg.String != "" {
 			m["errorMsg"] = row.ErrorMsg.String
+		}
+		if row.WarningMsg != "" {
+			m["warningMsg"] = row.WarningMsg
 		}
 		if row.InputTokens.Valid {
 			m["inputTokens"] = row.InputTokens.Int64

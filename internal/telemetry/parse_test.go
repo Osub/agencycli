@@ -40,3 +40,35 @@ func TestParseStreamJSONUsage_Cursor(t *testing.T) {
 		t.Fatalf("CacheReadTokens: got %d, want 16000", u.CacheReadTokens)
 	}
 }
+
+func TestParseStreamJSONUsage_CodexTokenCount(t *testing.T) {
+	data := []byte(`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":602901,"cached_input_tokens":528128,"output_tokens":3752,"reasoning_output_tokens":2048,"total_tokens":606653}}}}
+`)
+	u := ParseStreamJSONUsage(data)
+	if !u.SawResult {
+		t.Fatal("expected SawResult")
+	}
+	if u.InputTokens != 602901 {
+		t.Fatalf("InputTokens: got %d, want 602901", u.InputTokens)
+	}
+	if u.OutputTokens != 3752 {
+		t.Fatalf("OutputTokens: got %d, want 3752", u.OutputTokens)
+	}
+	if u.CacheReadTokens != 528128 {
+		t.Fatalf("CacheReadTokens: got %d, want 528128", u.CacheReadTokens)
+	}
+}
+
+func TestParseCodexTextUsage(t *testing.T) {
+	data := []byte("session id: 019e01cb-2146-79a3-ab34-54e799203721\n\ntokens used\n78,525\n")
+	u := ParseCodexTextUsage(data)
+	if !u.SawResult {
+		t.Fatal("expected SawResult")
+	}
+	if !u.TotalOnly {
+		t.Fatal("expected TotalOnly")
+	}
+	if u.InputTokens != 78525 {
+		t.Fatalf("InputTokens: got %d, want 78525", u.InputTokens)
+	}
+}

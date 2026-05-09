@@ -434,7 +434,14 @@ function UsersSection() {
 
 type ProviderRow = {
   id: string; name: string; type: string; baseUrl?: string; model?: string
-  hasKey: boolean; env?: Record<string, string>
+  hasKey: boolean; env?: Record<string, string>; pricing?: ProviderPricing
+}
+
+type ProviderPricing = {
+  inputPerM?: number
+  cachedInputPerM?: number
+  outputPerM?: number
+  totalPerM?: number
 }
 
 const PROVIDER_TYPES = ['anthropic', 'openai', 'gemini', 'custom'] as const
@@ -459,7 +466,7 @@ function ProvidersSection() {
   useEffect(() => { void refresh() }, [refresh])
 
   function openNew() {
-    setEditing({ name: '', type: 'anthropic', baseUrl: '', model: '', apiKey: '' })
+    setEditing({ name: '', type: 'anthropic', baseUrl: '', model: '', apiKey: '', pricing: {} })
     setShowKey(false)
     setErr(null)
   }
@@ -479,6 +486,7 @@ function ProvidersSection() {
         type: editing.type || 'anthropic',
         baseUrl: editing.baseUrl || '',
         model: editing.model || '',
+        pricing: normalizePricing(editing.pricing),
       }
       if (editing.apiKey) body.apiKey = editing.apiKey
       if (editing.id) {
@@ -500,6 +508,26 @@ function ProvidersSection() {
   }
 
   const fieldCls = 'w-full rounded-md border border-neutral-200/80 bg-neutral-50/50 px-3 py-2 text-sm outline-none transition-colors focus:border-sky-400 dark:border-zinc-700/60 dark:bg-zinc-800/50 dark:text-zinc-200 dark:[color-scheme:dark]'
+  const priceField = (key: keyof ProviderPricing, label: string, placeholder: string) => (
+    <label className="flex min-w-0 flex-col gap-1">
+      <span className="text-xs font-medium text-neutral-500 dark:text-zinc-500">{label}</span>
+      <input
+        type="number"
+        min="0"
+        step="0.000001"
+        value={editing?.pricing?.[key] ?? ''}
+        onChange={e => setEditing({
+          ...editing!,
+          pricing: {
+            ...(editing!.pricing ?? {}),
+            [key]: e.target.value === '' ? undefined : Number(e.target.value),
+          },
+        })}
+        className={cn(fieldCls, 'font-mono text-xs')}
+        placeholder={placeholder}
+      />
+    </label>
+  )
 
   return (
     <section className="rounded-xl border border-neutral-200/80 bg-white p-5 dark:border-zinc-700/60 dark:bg-zinc-900/40">
@@ -528,6 +556,11 @@ function ProvidersSection() {
                 <span className="text-xs text-neutral-400 dark:text-zinc-500">
                   {p.type}{p.model ? ` · ${p.model}` : ''}{p.baseUrl ? ` · ${p.baseUrl}` : ''}{p.hasKey ? ' · 🔑' : ''}
                 </span>
+                {hasPricing(p.pricing) && (
+                  <span className="mt-0.5 text-[11px] text-emerald-600 dark:text-emerald-400">
+                    {t('provider.pricingConfigured')}
+                  </span>
+                )}
               </div>
               <div className="flex gap-1">
                 <button type="button" onClick={() => openEdit(p)}
@@ -546,7 +579,7 @@ function ProvidersSection() {
 
       {editing && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4" onClick={() => !saving && setEditing(null)}>
-          <div className="w-full max-w-md rounded-xl border border-neutral-200 bg-white shadow-lg dark:border-zinc-700 dark:bg-zinc-900 animate-scale-in" onClick={e => e.stopPropagation()}>
+          <div className="max-h-[85vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-neutral-200 bg-white shadow-lg dark:border-zinc-700 dark:bg-zinc-900 animate-scale-in" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between border-b border-neutral-200 px-5 py-3 dark:border-zinc-700">
               <h2 className="text-base font-semibold text-neutral-900 dark:text-zinc-100">
                 {editing.id ? t('provider.edit') : t('provider.add')}
@@ -572,6 +605,18 @@ function ProvidersSection() {
                 <span className="text-sm font-medium text-neutral-600 dark:text-zinc-400">{t('provider.modelLabel')}</span>
                 <input value={editing.model ?? ''} onChange={e => setEditing({ ...editing, model: e.target.value })} className={cn(fieldCls, 'font-mono text-xs')} placeholder="claude-sonnet-4-20250514" />
               </label>
+              <div className="rounded-lg border border-neutral-200/80 p-3 dark:border-zinc-700/60">
+                <div className="mb-2">
+                  <span className="text-sm font-medium text-neutral-700 dark:text-zinc-300">{t('provider.pricingTitle')}</span>
+                  <p className="mt-1 text-[11px] leading-relaxed text-neutral-400 dark:text-zinc-500">{t('provider.pricingHint')}</p>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {priceField('inputPerM', t('provider.inputPrice'), '1.25')}
+                  {priceField('cachedInputPerM', t('provider.cachedInputPrice'), '0.125')}
+                  {priceField('outputPerM', t('provider.outputPrice'), '10')}
+                  {priceField('totalPerM', t('provider.totalPrice'), '2')}
+                </div>
+              </div>
               <label className="flex flex-col gap-1">
                 <span className="text-sm font-medium text-neutral-600 dark:text-zinc-400">API Key</span>
                 <div className="flex items-center gap-2">
@@ -599,6 +644,21 @@ function ProvidersSection() {
       )}
     </section>
   )
+}
+
+function normalizePricing(pricing?: ProviderPricing): ProviderPricing {
+  const out: ProviderPricing = {}
+  for (const key of ['inputPerM', 'cachedInputPerM', 'outputPerM', 'totalPerM'] as const) {
+    const value = pricing?.[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+function hasPricing(pricing?: ProviderPricing): boolean {
+  return Object.keys(normalizePricing(pricing)).length > 0
 }
 
 function CCConnectSection() {

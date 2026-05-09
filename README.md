@@ -43,7 +43,7 @@
 
 **agencycli** is a lightweight CLI for building and operating teams of AI agents. You define the org chart once — teams, roles, projects, skills — and agents assemble their own context, pick up tasks, and run autonomously on a heartbeat schedule.
 
-The killer feature: **agents can hire, message, and coordinate with each other.** Your PM agent can create a task for the dev agent, the dev agent can ask a human for confirmation before merging, and the QA agent wakes up every 30 minutes to scan for open PRs — all without you lifting a finger.
+The killer feature: **agents can hire, message, and coordinate with each other.** Your PM agent can create tasks, organize project knowledge, docs, and skills, the dev agent can ask a human for confirmation before merging, and the QA agent wakes up every 30 minutes to scan for open PRs — all without you lifting a finger.
 
 https://github.com/user-attachments/assets/dbeedf20-f967-4a4f-bb7b-49dc254fcd0d
 

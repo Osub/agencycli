@@ -25,14 +25,15 @@ type RunRow struct {
 
 	StartedAt, FinishedAt time.Time
 
-	TaskID, TaskTitle   sql.NullString
-	Model               string
-	APIModel            string
-	APIBaseURL          string
-	CommandSummary      string
-	LogPath             string
-	SessionID           sql.NullString
-	ErrorMsg            sql.NullString
+	TaskID, TaskTitle sql.NullString
+	Model             string
+	APIModel          string
+	APIBaseURL        string
+	CommandSummary    string
+	LogPath           string
+	SessionID         sql.NullString
+	ErrorMsg          sql.NullString
+	WarningMsg        string
 }
 
 // Summary aggregates for a time window.
@@ -154,6 +155,91 @@ func ReadRuns(db *sql.DB, from, to *time.Time, project string) ([]RunRow, error)
 	return out, rows.Err()
 }
 
+// HydrateRunRows fills missing token/cost fields from run logs. This lets older
+// telemetry rows benefit from newer parsers without rewriting the database.
+func HydrateRunRows(root string, rows []RunRow) []RunRow {
+	for i := range rows {
+		hydrateRunRow(root, &rows[i])
+	}
+	return rows
+}
+
+func hydrateRunRow(root string, r *RunRow) {
+	hasTokens := r.InputTokens.Valid || r.OutputTokens.Valid || r.CacheReadTokens.Valid
+	needsCost := !r.HasCost || !r.TotalCostUSD.Valid
+	var usage StreamUsage
+	var data []byte
+	if r.LogPath != "" {
+		path := r.LogPath
+		if root != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(root, path)
+		}
+		if b, err := os.ReadFile(path); err == nil {
+			data = b
+			usage = ParseLogUsage(b)
+		}
+	}
+
+	if r.Status == "done_success" && len(data) > 0 {
+		if failure, ok := DetectModelToolFailure(data); ok {
+			if DetectAgencycliTaskTerminalStatus(data) == "done_success" {
+				r.WarningMsg = "Recovered after intermediate tool failure:\n" + failure.Message
+			} else {
+				r.Status = "done_failed"
+				r.ErrorMsg = sql.NullString{String: "model tool failure despite zero CLI exit:\n" + failure.Message, Valid: true}
+			}
+		}
+	}
+
+	if hasTokens && !needsCost {
+		return
+	}
+
+	if usage.SawResult {
+		if !r.InputTokens.Valid {
+			r.InputTokens = sql.NullInt64{Int64: usage.InputTokens, Valid: true}
+		}
+		if !r.OutputTokens.Valid {
+			r.OutputTokens = sql.NullInt64{Int64: usage.OutputTokens, Valid: true}
+		}
+		if !r.CacheReadTokens.Valid {
+			r.CacheReadTokens = sql.NullInt64{Int64: usage.CacheReadTokens, Valid: true}
+		}
+		if usage.HasCost && needsCost {
+			r.TotalCostUSD = sql.NullFloat64{Float64: usage.TotalCostUSD, Valid: true}
+			r.HasCost = true
+			return
+		}
+	}
+
+	if r.HasCost && r.TotalCostUSD.Valid {
+		return
+	}
+	inTok, outTok, cacheTok := nullInt64Value(r.InputTokens), nullInt64Value(r.OutputTokens), nullInt64Value(r.CacheReadTokens)
+	if inTok == 0 && outTok == 0 && cacheTok == 0 {
+		return
+	}
+	model := r.APIModel
+	if model == "" && len(data) > 0 {
+		model = ModelFromLog(data)
+	}
+	if model == "" {
+		model = r.Model
+	}
+	totalOnly := usage.SawResult && usage.TotalOnly
+	if cost, ok := EstimateCostUSDForRoot(root, model, inTok, outTok, cacheTok, totalOnly); ok {
+		r.TotalCostUSD = sql.NullFloat64{Float64: cost, Valid: true}
+		r.HasCost = true
+	}
+}
+
+func nullInt64Value(n sql.NullInt64) int64 {
+	if !n.Valid {
+		return 0
+	}
+	return n.Int64
+}
+
 func parseDBTime(s string) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
@@ -205,7 +291,7 @@ func Summarize(rows []RunRow) Summary {
 
 // SessionUsage holds aggregated token/cost data for a specific session.
 type SessionUsage struct {
-	LastInputTokens   int64   // input_tokens from the most recent run (≈ current context fill)
+	LastInputTokens   int64 // input_tokens from the most recent run (≈ current context fill)
 	TotalInputTokens  int64
 	TotalOutputTokens int64
 	TotalCacheRead    int64
