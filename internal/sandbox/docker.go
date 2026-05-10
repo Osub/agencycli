@@ -31,7 +31,7 @@ const (
 	DefaultMemoryMB = 4096
 
 	// Image registry prefix for agencycli-provided sandbox images.
-	imagePrefix = "ghcr.io/agencycli"
+	imagePrefix = "ghcr.io/chenhg5/agencycli"
 
 	// AgencycliMount is where the agencycli binary is mounted inside the
 	// container so that agents can run `agencycli task add` etc.
@@ -41,6 +41,11 @@ const (
 	// container. If <root>/bin/ exists on the host, it is mounted here and
 	// prepended to PATH so those binaries are directly accessible.
 	AgencycliBin = "/agencycli/bin"
+
+	// ContainerDefaultPATH mirrors the tool locations provided by the sandbox
+	// images. Keep Go paths here because Docker -e PATH=... replaces the image
+	// ENV PATH instead of expanding it.
+	ContainerDefaultPATH = "/usr/local/go/bin:/root/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
 // defaultImage returns the default Docker image for a given agent model.
@@ -68,7 +73,7 @@ var defaultCredentialMounts = map[entity.AgentModel][]string{
 		"~/.ssh:/root/.ssh:ro",
 	},
 	entity.ModelCodex: {
-		"~/.codex:/root/.codex:ro",
+		"~/.codex:/root/.codex",
 		"~/.config/gh:/root/.config/gh:ro",
 		"~/.ssh:/root/.ssh:ro",
 	},
@@ -162,7 +167,7 @@ func BuildArgs(agentDir string, model entity.AgentModel, cfg *entity.DockerSandb
 	)
 	if fi, err := os.Stat(binHostDir); err == nil && fi.IsDir() {
 		args = append(args, "-v", binHostDir+":"+AgencycliBin)
-		args = append(args, "-e", "PATH="+AgencycliBin+":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+		args = append(args, "-e", "PATH="+AgencycliBin+":"+ContainerDefaultPATH)
 	}
 
 	// ── Credential mounts ────────────────────────────────────────────────────

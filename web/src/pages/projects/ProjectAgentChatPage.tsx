@@ -3,7 +3,7 @@ import { useParams, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Edit3, Maximize2, Minimize2, RefreshCw, Send, Sparkles, Square } from 'lucide-react'
 import { ConversationLog } from '../../components/ui/ConversationLog'
-import { apiFetch, apiUrl } from '../../lib/api'
+import { apiFetch, apiDelete, apiUrl } from '../../lib/api'
 import { getStoredToken } from '../../lib/auth'
 import { cn } from '../../lib/cn'
 
@@ -75,6 +75,10 @@ export default function ProjectAgentChatPage() {
   const [sessionEditorOpen, setSessionEditorOpen] = useState(false)
   const [sessionDraft, setSessionDraft] = useState(initialSessionId)
   const [followingLiveLog, setFollowingLiveLog] = useState(false)
+  const [stopped, setStopped] = useState(false)
+  // Ref to track whether SSE has ever started; prevents in-flight live-log
+  // polls (sent before SSE) from overwriting SSE-streamed content.
+  const sseActiveRef = useRef(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -104,9 +108,11 @@ export default function ProjectAgentChatPage() {
     }
   }, [historyPath])
 
+  // Load history once on mount. When the URL has no sessionId, the API resolves
+  // the current heartbeat session or falls back to the latest recorded run.
   useEffect(() => {
     void loadHistory(initialSessionId)
-  }, [initialSessionId, loadHistory])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!projectId || !agentName) return
@@ -144,8 +150,12 @@ export default function ProjectAgentChatPage() {
     el.style.height = Math.min(el.scrollHeight, 128) + 'px'
   }, [input])
 
+  // Live-log polling: only runs when SSE is NOT active (loading=false).
+  // SSE is the primary real-time source; live-log is a fallback for initial
+  // content when SSE delivers nothing. Guard inside poll to handle in-flight
+  // requests that arrive after SSE starts.
   useEffect(() => {
-    if (!projectId || !agentName || loading) return
+    if (!projectId || !agentName || loading || stopped) return
     let cancelled = false
     let timer: number | null = null
 
@@ -154,19 +164,20 @@ export default function ProjectAgentChatPage() {
         const data = await apiFetch<LiveLogResp>(
           `/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentName)}/live-log`,
         )
-        if (cancelled) return
+        // Guard: if SSE has taken over (loading became true) OR an in-flight poll
+        // arrived after SSE started, don't overwrite SSE content.
+        if (cancelled || loading || sseActiveRef.current) return
         if (data.content && !data.finished) {
-          if (!sessionId || data.content.includes(sessionId)) {
-            setContent(data.content)
-            setFollowingLiveLog(true)
-          }
-        } else if (data.finished) {
+          setContent(data.content)
+          setFollowingLiveLog(true)
+        }
+        if (data.finished) {
           setFollowingLiveLog(false)
         }
       } catch {
-        if (!cancelled) setFollowingLiveLog(false)
+        if (!cancelled && !loading && !sseActiveRef.current) setFollowingLiveLog(false)
       }
-      if (!cancelled) timer = window.setTimeout(poll, 2000)
+      if (!cancelled && !loading && !sseActiveRef.current) timer = window.setTimeout(poll, 2000)
     }
 
     void poll()
@@ -174,7 +185,7 @@ export default function ProjectAgentChatPage() {
       cancelled = true
       if (timer != null) window.clearTimeout(timer)
     }
-  }, [projectId, agentName, sessionId, loading])
+  }, [projectId, agentName, loading, stopped])
 
   useEffect(() => {
     if (!focusMode) return
@@ -193,10 +204,13 @@ export default function ProjectAgentChatPage() {
     resetTextareaHeight(inputRef.current)
     setError(null)
     setLoading(true)
+    setStopped(false)
+    sseActiveRef.current = true
     setContent((prev) => appendLog(prev, JSON.stringify({ type: 'human', content: text })))
 
     const controller = new AbortController()
     abortRef.current = controller
+    let processReplaced = false
     try {
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -259,10 +273,21 @@ export default function ProjectAgentChatPage() {
       const msg = stopped ? t('agentChat.stopped') : (e instanceof Error ? e.message : String(e))
       setError(stopped ? null : msg)
       setContent((prev) => appendLog(prev, `=== ${msg} ===`))
+      // Flag for finally: if SSE ended for any reason other than user abort
+      // (i.e. another process took over the log), keep sseActiveRef=true so
+      // live-log polling stays suppressed (the log now belongs to the newer
+      // process and must not overwrite this conversation's content).
+      processReplaced = !stopped
+      // Re-throw so finally runs after catch propagates.
+      throw e
     } finally {
       abortRef.current = null
       setFreshNext(false)
       setLoading(false)
+      // Only reset sseActiveRef if the SSE ended cleanly (user stopped or
+      // normal completion). If processReplaced=true, a newer SSE is owning the
+      // log file — leave sseActiveRef=true to block live-log polling.
+      if (!processReplaced) sseActiveRef.current = false
       inputRef.current?.focus()
     }
   }
@@ -274,6 +299,14 @@ export default function ProjectAgentChatPage() {
     }
   }
 
+  function stopChat() {
+    abortRef.current?.abort()
+    setStopped(true)
+    if (projectId && agentName) {
+      void apiDelete(`/api/v1/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentName)}/chat`)
+    }
+  }
+
   function startFresh() {
     abortRef.current?.abort()
     setSessionId('')
@@ -281,6 +314,7 @@ export default function ProjectAgentChatPage() {
     setContent('')
     setError(null)
     setFreshNext(true)
+    setStopped(false)
     resetTextareaHeight(inputRef.current)
     inputRef.current?.focus()
   }
@@ -358,7 +392,7 @@ export default function ProjectAgentChatPage() {
               type="button"
               onClick={startFresh}
               disabled={loading}
-              className="rounded-md border border-sky-200 bg-sky-50 px-3 py-1.5 text-sm font-medium text-sky-700 transition-colors hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-400"
+              className="rounded-md border border-sky-200 bg-sky-50 px-3 py-1.5 text-sm font-medium text-sky-700 transition-colors hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-400 dark:hover:bg-sky-900/50"
             >
               {t('agentChat.newSession')}
             </button>
@@ -452,7 +486,7 @@ export default function ProjectAgentChatPage() {
           {loading ? (
             <button
               type="button"
-              onClick={() => abortRef.current?.abort()}
+              onClick={stopChat}
               className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-red-500 text-white transition-colors hover:bg-red-600"
             >
               <Square className="size-3" fill="currentColor" />

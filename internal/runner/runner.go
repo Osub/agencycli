@@ -66,20 +66,6 @@ output:
 AGENCYCLI_LESSON_BEGIN
 # Short reusable lesson title
 
-## Applies when
-- ...
-
-## Steps
-- ...
-
-## Pitfalls
-- ...
-
-## Validation
-- ...
-AGENCYCLI_LESSON_END
-`
-
 // Runner executes tasks for agents using their configured CLI.
 type Runner struct {
 	root       string
@@ -280,6 +266,16 @@ func (r *Runner) execPrompt(project, agentName, prompt, sessionID string, envOve
 
 	ec := exitCodeOrZero(cmd)
 	if runErr != nil {
+		if sessionID != "" && isCodexResumeMissingRolloutError(output) {
+			fmt.Fprintf(logFile, "\n=== codex rollout missing for saved session — clearing heartbeat session + retrying fresh ===\n")
+			r.recordAgentRun(telemetry.KindExec, project, agentName, "", "", string(model), sandboxLabel,
+				apiModel, apiBaseURL,
+				runStarted, runFinished, entity.TaskStatusDoneFailed, &ec, result.SessionID,
+				"codex rollout missing for saved session, retrying fresh",
+				logPath, telemetry.FormatExecCommand(executable, args), prompt, outBuf.Bytes())
+			r.clearHeartbeatSession(project, agentName)
+			return r.ExecPrompt(project, agentName, prompt, "")
+		}
 		if sessionID != "" && isThinkingSignatureError(output) {
 			fmt.Fprintf(logFile, "\n=== thinking block signature invalid — clearing heartbeat session + retrying fresh ===\n")
 			r.recordAgentRun(telemetry.KindExec, project, agentName, "", "", string(model), sandboxLabel,
@@ -289,6 +285,9 @@ func (r *Runner) execPrompt(project, agentName, prompt, sessionID string, envOve
 				logPath, telemetry.FormatExecCommand(executable, args), prompt, outBuf.Bytes())
 			r.clearHeartbeatSession(project, agentName)
 			return r.execPrompt(project, agentName, prompt, "", envOverride)
+		}
+		if discardSessionIDOnFailure(model) {
+			result.SessionID = ""
 		}
 		result.Status = entity.TaskStatusDoneFailed
 		result.ErrorMsg = buildErrorMsg(runErr, outBuf.Bytes())
@@ -508,6 +507,16 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 	}
 
 	if runErr != nil {
+		if sessionID != "" && isCodexResumeMissingRolloutError(output) {
+			fmt.Fprintf(logFile, "\n=== codex rollout missing for saved session — clearing heartbeat session + retrying fresh ===\n")
+			r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, string(model), sandboxLabel,
+				apiModel, apiBaseURL,
+				runStarted, runFinished, entity.TaskStatusDoneFailed, &ec, result.SessionID,
+				"codex rollout missing for saved session, retrying fresh",
+				logPath, cmdSummary, fullPrompt, outBuf.Bytes())
+			r.clearHeartbeatSession(project, agentName)
+			return r.RunTask(project, agentName, task, "")
+		}
 		if sessionID != "" && isThinkingSignatureError(output) {
 			fmt.Fprintf(logFile, "\n=== thinking block signature invalid — clearing heartbeat session + retrying fresh ===\n")
 			r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, string(model), sandboxLabel,
@@ -517,6 +526,9 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 				logPath, cmdSummary, fullPrompt, outBuf.Bytes())
 			r.clearHeartbeatSession(project, agentName)
 			return r.RunTask(project, agentName, task, "")
+		}
+		if discardSessionIDOnFailure(model) {
+			result.SessionID = ""
 		}
 		result.Status = entity.TaskStatusDoneFailed
 		result.ErrorMsg = buildErrorMsg(runErr, outBuf.Bytes())
@@ -590,6 +602,20 @@ func (r *Runner) captureTaskLessons(project, agentName string, task *entity.Task
 func isThinkingSignatureError(output string) bool {
 	return strings.Contains(output, "Invalid signature in thinking block") ||
 		strings.Contains(output, "Invalid `signature` in `thinking` block")
+}
+
+func isCodexResumeMissingRolloutError(output string) bool {
+	return strings.Contains(output, "thread/resume failed: no rollout found for thread id") ||
+		strings.Contains(output, "no rollout found for thread id")
+}
+
+func discardSessionIDOnFailure(model entity.AgentModel) bool {
+	switch entity.NormaliseModel(model) {
+	case entity.ModelCodex, entity.ModelQoder:
+		return true
+	default:
+		return false
+	}
 }
 
 // clearHeartbeatSession zeroes the stored session ID in the heartbeat config

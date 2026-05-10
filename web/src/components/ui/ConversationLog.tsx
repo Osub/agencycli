@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { Bot, User, Wrench, Terminal, AlertTriangle, CheckCircle2, Info, BrainCircuit } from 'lucide-react'
+import { Bot, User, Wrench, Terminal, AlertTriangle, CheckCircle2, Info, BrainCircuit, FileDiff } from 'lucide-react'
 import { cn } from '../../lib/cn'
 
 type ContentBlock =
@@ -34,6 +34,9 @@ type StreamEvent = {
   usage?: { input_tokens?: number; output_tokens?: number }
   content?: ContentBlock[] | string
   role?: string
+  // claude -p stream-json content block events
+  index?: number
+  content_block?: Record<string, any>
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
@@ -45,6 +48,36 @@ type ConversationItem =
   | { kind: 'assistant'; blocks: ContentBlock[] }
   | { kind: 'tool_result'; name?: string; content: string; isError: boolean }
   | { kind: 'result'; text: string; cost?: number; turns?: number; isError: boolean }
+  | { kind: 'usage'; text: string }
+
+function pushAssistantText(items: ConversationItem[], text: string) {
+  if (!text.trim()) return
+  const last = items[items.length - 1]
+  if (last?.kind === 'assistant') {
+    const lastBlock = last.blocks[last.blocks.length - 1]
+    if (lastBlock?.type === 'text') {
+      lastBlock.text = lastBlock.text ? `${lastBlock.text}\n${text}` : text
+      return
+    }
+  }
+  items.push({ kind: 'assistant', blocks: [{ type: 'text', text }] })
+}
+
+function pushAssistantBlocks(items: ConversationItem[], blocks: ContentBlock[]) {
+  const textParts = blocks
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+    .map((b) => b.text)
+    .filter((text) => text.trim())
+  const toolUseBlocks = blocks.filter((b) => b.type === 'tool_use')
+
+  if (textParts.length > 0 && toolUseBlocks.length === 0) {
+    pushAssistantText(items, textParts.join('\n'))
+    return
+  }
+  if (textParts.length > 0 || toolUseBlocks.length > 0) {
+    items.push({ kind: 'assistant', blocks: [...textParts.map((text) => ({ type: 'text' as const, text })), ...toolUseBlocks] })
+  }
+}
 
 function extractCursorToolInfo(tc: Record<string, unknown>): { name: string; desc: string; input: unknown } | null {
   const toolNames: Record<string, (inner: Record<string, unknown>) => { name: string; desc: string; input: unknown }> = {
@@ -110,7 +143,7 @@ function extractCursorToolResult(tc: Record<string, unknown>): { content: string
       }
       if (key === 'readToolCall') {
         const text = (s.content as string) || (s.text as string) || ''
-        return { content: text ? truncateStr(text, 3000) : '(read ok)', isError: false }
+        return { content: text ? truncateStr(text, 8000) : '(read ok)', isError: false }
       }
       return { content: JSON.stringify(s, null, 2), isError: false }
     }
@@ -123,7 +156,11 @@ function extractCursorToolResult(tc: Record<string, unknown>): { content: string
 }
 
 function isCodexLog(lines: string[]): boolean {
-  return lines.some(l => l.includes('OpenAI Codex') || /^model:\s/.test(l.trim()))
+  // agencycli prepends its own run headers before the Codex transcript, so do
+  // not reject logs just because they contain "=== agencycli exec".
+  const trimmed = lines.map((l) => l.trim())
+  return trimmed.some(l => l.includes('OpenAI Codex') || /^model:\s/.test(l)) ||
+    (trimmed.includes('user') && trimmed.includes('codex'))
 }
 
 function parseCodexLog(lines: string[]): ConversationItem[] {
@@ -134,7 +171,6 @@ function parseCodexLog(lines: string[]): ConversationItem[] {
   let execCmd = ''
   let execExitCode = -1
   let tokensTotal = 0
-  let seenResponse = false
 
   const isNoise = (l: string) =>
     /^\d{4}-\d{2}-\d{2}T.*\s(ERROR|WARN)\s/.test(l) ||
@@ -160,10 +196,7 @@ function parseCodexLog(lines: string[]): ConversationItem[] {
         })
         break
       case 'response':
-        if (!seenResponse) {
-          seenResponse = true
-          items.push({ kind: 'assistant', blocks: [{ type: 'text', text }] })
-        }
+        pushAssistantText(items, text)
         break
     }
   }
@@ -263,16 +296,7 @@ function parseCodexLog(lines: string[]): ConversationItem[] {
   if (tokensTotal > 0) {
     const lastResult = items.findIndex(it => it.kind === 'result')
     if (lastResult === -1) {
-      const lastAssistant = [...items].reverse().find(it => it.kind === 'assistant')
-      const resultText = lastAssistant && lastAssistant.kind === 'assistant'
-        ? lastAssistant.blocks.find(b => b.type === 'text')?.text || 'Completed'
-        : 'Completed'
-      items.push({
-        kind: 'result',
-        text: `${tokensTotal.toLocaleString()} tokens used`,
-        isError: false,
-      })
-      void resultText
+      items.push({ kind: 'usage', text: `${tokensTotal.toLocaleString()} tokens used` })
     }
   }
 
@@ -282,7 +306,10 @@ function parseCodexLog(lines: string[]): ConversationItem[] {
 function parseLog(content: string): ConversationItem[] {
   const lines = content.split('\n')
 
-  if (isCodexLog(lines)) return parseCodexLog(lines)
+  const codex = isCodexLog(lines)
+  if (codex) {
+    return parseCodexLog(lines)
+  }
 
   const items: ConversationItem[] = []
   let thinkingBuf = ''
@@ -362,7 +389,7 @@ function parseLog(content: string): ConversationItem[] {
             blocks: [{
               type: 'tool_use',
               id: ev.call_id,
-              name: info.name + (info.desc ? `: ${truncateStr(info.desc, 80)}` : ''),
+              name: info.name + (info.desc ? `: ${truncateStr(info.desc, 120)}` : ''),
               input: info.input,
             }],
           })
@@ -380,6 +407,32 @@ function parseLog(content: string): ConversationItem[] {
       continue
     }
 
+    // --- claude -p stream-json content block events ---
+    if (ev.type === 'content' && ev.content_block) {
+      const blk = ev.content_block as Record<string, unknown>
+      if (blk.type === 'text' && typeof blk.text === 'string' && blk.text) {
+        pushAssistantText(items, blk.text)
+      } else if (blk.type === 'tool_use' && typeof blk.name === 'string') {
+        const name = blk.name as string
+        const input = blk.input
+        items.push({
+          kind: 'assistant',
+          blocks: [{
+            type: 'tool_use',
+            name,
+            input,
+          }],
+        })
+      } else if (blk.type === 'tool_result' && typeof blk.content === 'string' && blk.content) {
+        items.push({
+          kind: 'tool_result',
+          content: blk.content,
+          isError: Boolean(blk.is_error),
+        })
+      }
+      continue
+    }
+
     if (ev.type === 'assistant') {
       const c = ev.message?.content
       if (Array.isArray(c)) {
@@ -389,7 +442,7 @@ function parseLog(content: string): ConversationItem[] {
         const toolResultBlocks = blocks.filter((b) => b.type === 'tool_result')
 
         if (textBlocks.length > 0 || toolUseBlocks.length > 0) {
-          items.push({ kind: 'assistant', blocks: [...textBlocks, ...toolUseBlocks] })
+          pushAssistantBlocks(items, [...textBlocks, ...toolUseBlocks])
         }
         for (const tr of toolResultBlocks) {
           if (tr.type === 'tool_result') {
@@ -401,7 +454,7 @@ function parseLog(content: string): ConversationItem[] {
           }
         }
       } else if (typeof c === 'string' && c) {
-        items.push({ kind: 'assistant', blocks: [{ type: 'text', text: c }] })
+        pushAssistantText(items, c)
       }
       continue
     }
@@ -417,6 +470,13 @@ function parseLog(content: string): ConversationItem[] {
       })
       continue
     }
+
+    // Fallback: completely unrecognized event types — show as raw header so we can debug.
+    // (content/type events with unrecognized block types also land here)
+    const knownTypes = ['thinking', 'system', 'human', 'user', 'tool_call', 'assistant', 'content', 'result']
+    if (!knownTypes.includes(ev.type)) {
+      items.push({ kind: 'header', text: `[raw:${ev.type}] ${line.slice(0, 120)}` })
+    }
   }
 
   flushThinking()
@@ -425,6 +485,68 @@ function parseLog(content: string): ConversationItem[] {
 
 function truncateStr(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + '…' : s
+}
+
+function isDiffLike(text: string): boolean {
+  const lines = text.split('\n').map((line) => line.trimEnd()).filter(Boolean)
+  if (lines.length < 4) return false
+  if (lines[0]?.startsWith('diff --git ') || lines[0]?.startsWith('Index: ')) return true
+  const hasHunk = lines.some((line) => /^@@ .* @@/.test(line))
+  const hasFileMarkers = lines.some((line) => line.startsWith('--- ')) && lines.some((line) => line.startsWith('+++ '))
+  const changed = lines.filter((line) =>
+    (/^[+-]/.test(line) && !line.startsWith('+++') && !line.startsWith('---')) ||
+    line.startsWith('@@ '),
+  ).length
+  return (hasHunk || hasFileMarkers) && changed >= 3
+}
+
+function findDiffStart(text: string): number {
+  const lines = text.split('\n')
+  return lines.findIndex((line) => line.startsWith('diff --git ') || line.startsWith('Index: '))
+}
+
+function DiffBlock({ text, defaultOpen = false }: { text: string; defaultOpen?: boolean }) {
+  const lineCount = text.split('\n').length
+  const lines = text.split('\n')
+  return (
+    <details open={defaultOpen} className="group rounded-md border border-neutral-200/70 bg-neutral-50/70 dark:border-zinc-700/50 dark:bg-zinc-900/40">
+      <summary className="flex min-w-0 items-center gap-2 px-3 py-2 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-100/70 dark:text-zinc-400 dark:hover:bg-zinc-800/70">
+        <FileDiff className="size-3.5 shrink-0 text-sky-600 dark:text-sky-400" strokeWidth={1.8} />
+        <span className="truncate">Diff</span>
+        <span className="shrink-0 font-normal text-neutral-400 dark:text-zinc-500">{lineCount.toLocaleString()} lines</span>
+        <span className="ml-auto shrink-0 text-[11px] font-normal text-neutral-400 group-open:hidden dark:text-zinc-500">Expand</span>
+        <span className="ml-auto hidden shrink-0 text-[11px] font-normal text-neutral-400 group-open:inline dark:text-zinc-500">Collapse</span>
+      </summary>
+      <pre className="max-h-72 overflow-auto border-t border-neutral-200/70 bg-white/70 p-0 text-xs leading-relaxed whitespace-pre dark:border-zinc-700/50 dark:bg-zinc-950/50">
+        <code className="block min-w-max py-3 font-mono">
+          {lines.map((line, i) => (
+            <span key={i} className={cn('block px-3', diffLineClass(line))}>
+              {line || ' '}
+            </span>
+          ))}
+        </code>
+      </pre>
+    </details>
+  )
+}
+
+function diffLineClass(line: string): string {
+  if (line.startsWith('diff --git ') || line.startsWith('Index: ')) {
+    return 'bg-sky-50 text-sky-700 dark:bg-sky-950/30 dark:text-sky-300'
+  }
+  if (line.startsWith('@@ ')) {
+    return 'bg-violet-50 text-violet-700 dark:bg-violet-950/30 dark:text-violet-300'
+  }
+  if (line.startsWith('+++') || line.startsWith('---')) {
+    return 'bg-neutral-100 text-neutral-600 dark:bg-zinc-900 dark:text-zinc-400'
+  }
+  if (line.startsWith('+')) {
+    return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-300'
+  }
+  if (line.startsWith('-')) {
+    return 'bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-300'
+  }
+  return 'text-neutral-700 dark:text-zinc-300'
 }
 
 const mdComponents = {
@@ -485,8 +607,29 @@ const mdComponents = {
 } as import('react-markdown').Components
 
 function MdBlock({ text, className }: { text: string; className?: string }) {
+  const diffStart = findDiffStart(text)
+  if (diffStart >= 0) {
+    const lines = text.split('\n')
+    const before = lines.slice(0, diffStart).join('\n').trim()
+    const diff = lines.slice(diffStart).join('\n').trim()
+    if (isDiffLike(diff)) {
+      return (
+        <div className={cn('space-y-2', className)}>
+          {before && <MarkdownBlock text={before} />}
+          <DiffBlock text={diff} />
+        </div>
+      )
+    }
+  }
+  if (isDiffLike(text.trim())) {
+    return <DiffBlock text={text.trim()} />
+  }
+  return <MarkdownBlock text={text} className={className} />
+}
+
+function MarkdownBlock({ text, className }: { text: string; className?: string }) {
   return (
-    <div className={cn('prose-none text-sm leading-relaxed text-neutral-800 dark:text-zinc-200', className)}>
+    <div className={cn('prose-none overflow-x-auto text-sm leading-relaxed text-neutral-800 dark:text-zinc-200', className)}>
       <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
         {text}
       </Markdown>
@@ -498,14 +641,14 @@ function ToolInputDisplay({ input }: { input: unknown }) {
   if (input == null) return null
   const str = typeof input === 'string' ? input : JSON.stringify(input, null, 2)
   if (str.length <= 200) {
-    return <pre className="mt-1 whitespace-pre-wrap break-all text-[11px] leading-relaxed text-neutral-500 dark:text-zinc-500">{str}</pre>
+    return <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-neutral-500 dark:text-zinc-500">{str}</pre>
   }
   return (
     <details className="mt-1">
       <summary className="text-[11px] text-neutral-400 hover:text-neutral-600 dark:text-zinc-500 dark:hover:text-zinc-400">
         展开参数
       </summary>
-      <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-neutral-500 dark:text-zinc-500">{str}</pre>
+      <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-neutral-500 dark:text-zinc-500">{str}</pre>
     </details>
   )
 }
@@ -519,14 +662,14 @@ export function ConversationLog({ content }: { content: string }) {
   }
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 overflow-x-hidden">
       {items.map((item, i) => {
         switch (item.kind) {
           case 'header':
             return (
-              <div key={i} className="flex items-center gap-2 text-[11px] text-neutral-400 dark:text-zinc-500">
+              <div key={i} className="flex min-w-0 items-center gap-2 overflow-x-hidden text-[11px] text-neutral-400 dark:text-zinc-500">
                 <Terminal className="size-3 shrink-0" strokeWidth={1.5} />
-                <span className="font-mono">{item.text}</span>
+                <span className="truncate font-mono">{item.text}</span>
               </div>
             )
 
@@ -546,7 +689,7 @@ export function ConversationLog({ content }: { content: string }) {
                   <span>Thinking</span>
                   <span className="text-[10px] opacity-60">({item.text.length} chars)</span>
                 </summary>
-                <div className="ml-5 mt-1 max-h-48 overflow-auto rounded-md border border-neutral-200/60 bg-neutral-50/50 px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap text-neutral-500 dark:border-zinc-700/40 dark:bg-zinc-800/20 dark:text-zinc-500">
+                <div className="ml-5 mt-1 max-h-48 overflow-auto rounded-md border border-neutral-200/60 bg-neutral-50/50 px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap break-words text-neutral-500 dark:border-zinc-700/40 dark:bg-zinc-800/20 dark:text-zinc-500">
                   {truncateStr(item.text, 4000)}
                 </div>
               </details>
@@ -612,9 +755,13 @@ export function ConversationLog({ content }: { content: string }) {
                     ? 'border-red-200/60 bg-red-50/50 dark:border-red-800/30 dark:bg-red-900/10'
                     : 'border-neutral-200/60 bg-neutral-50/50 dark:border-zinc-700/40 dark:bg-zinc-800/20',
                 )}>
-                  <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all text-xs leading-relaxed text-neutral-600 dark:text-zinc-400">
-                    {truncateStr(item.content, 2000)}
-                  </pre>
+                  {isDiffLike(item.content) ? (
+                    <DiffBlock text={item.content} />
+                  ) : (
+                    <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words text-xs leading-relaxed text-neutral-600 dark:text-zinc-400">
+                      {truncateStr(item.content, 2000)}
+                    </pre>
+                  )}
                 </div>
               </div>
             )
@@ -643,6 +790,14 @@ export function ConversationLog({ content }: { content: string }) {
                   </p>
                   <MdBlock text={item.text} className="mt-1" />
                 </div>
+              </div>
+            )
+
+          case 'usage':
+            return (
+              <div key={i} className="flex items-center gap-2 rounded-md bg-neutral-50 px-3 py-1.5 dark:bg-zinc-800/40">
+                <Info className="size-3.5 shrink-0 text-neutral-400 dark:text-zinc-500" strokeWidth={1.8} />
+                <span className="text-xs text-neutral-500 dark:text-zinc-500">{item.text}</span>
               </div>
             )
 
