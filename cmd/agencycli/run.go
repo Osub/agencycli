@@ -138,6 +138,7 @@ This is a one-shot manual trigger. For recurring automated runs, use
 				if task.RunLogPath != "" {
 					fmt.Printf("  Log: %s\n", task.RunLogPath)
 				}
+				printCapturedLessons(result.LessonPaths)
 				if err := ts.ArchiveTask(project, agentName, task); err != nil {
 					return err
 				}
@@ -154,6 +155,7 @@ This is a one-shot manual trigger. For recurring automated runs, use
 				if task.RunLogPath != "" {
 					fmt.Printf("  Log: %s\n", task.RunLogPath)
 				}
+				printCapturedLessons(result.LessonPaths)
 				if task.RetryCount < task.MaxRetries {
 					task.RetryCount++
 					task.Status = entity.TaskStatusPending
@@ -175,6 +177,7 @@ This is a one-shot manual trigger. For recurring automated runs, use
 				if err := ts.UpdateTask(project, agentName, task); err != nil {
 					return err
 				}
+				printCapturedLessons(result.LessonPaths)
 				item := &entity.InboxItem{
 					TaskID:  task.ID,
 					Project: project,
@@ -200,6 +203,16 @@ This is a one-shot manual trigger. For recurring automated runs, use
 	cmd.Flags().StringVar(&taskID, "task", "", "specific task ID to run (default: next pending)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print what would be executed without running")
 	return cmd
+}
+
+func printCapturedLessons(paths []string) {
+	if len(paths) == 0 {
+		return
+	}
+	fmt.Println("  Lessons captured:")
+	for _, path := range paths {
+		fmt.Printf("    %s\n", path)
+	}
 }
 
 // nextPendingTask returns the highest-priority pending task (lowest priority

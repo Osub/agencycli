@@ -105,6 +105,15 @@ type APIProvider struct {
 	APIKey  string            `yaml:"api_key,omitempty"  json:"-"`
 	Model   string            `yaml:"model,omitempty"    json:"model,omitempty"`
 	Env     map[string]string `yaml:"env,omitempty"      json:"env,omitempty"`
+	Pricing ProviderPricing   `yaml:"pricing,omitempty"  json:"pricing,omitempty"`
+}
+
+// ProviderPricing stores model prices in USD per 1M tokens.
+type ProviderPricing struct {
+	InputPerM       float64 `yaml:"input_per_m,omitempty"        json:"inputPerM,omitempty"`
+	CachedInputPerM float64 `yaml:"cached_input_per_m,omitempty" json:"cachedInputPerM,omitempty"`
+	OutputPerM      float64 `yaml:"output_per_m,omitempty"       json:"outputPerM,omitempty"`
+	TotalPerM       float64 `yaml:"total_per_m,omitempty"        json:"totalPerM,omitempty"`
 }
 
 // Agency is the top-level organisational unit (the "company").

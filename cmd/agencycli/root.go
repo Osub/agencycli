@@ -16,8 +16,8 @@ var globalDir string
 var rootCmd = &cobra.Command{
 	SilenceErrors: true, // error is printed by main()
 	SilenceUsage:  true, // no usage on error
-	Use:   "agencycli",
-	Short: "AI agent organisation and context management",
+	Use:           "agencycli",
+	Short:         "AI agent organisation and context management",
 	Long: `agencycli manages the organisational context for AI agents.
 
 It lets you create an agency with teams and projects, then hire (or assign)
@@ -85,6 +85,7 @@ func init() {
 		newCheckUpdateCmd(),
 		newUpdateCmd(),
 		newDocsCmd(),
+		newSkillCmd(),
 		newOKRCmd(),
 		newMilestoneCmd(),
 		newEnvVarCmd(),

@@ -1,39 +1,68 @@
 package runner
 
 import (
+	"reflect"
 	"testing"
-
-	"github.com/chenhg5/agencycli/internal/entity"
 )
 
-func TestCodexInvokerParseSessionID(t *testing.T) {
+func TestCodexInvokerAddsProviderModel(t *testing.T) {
+	invoker := &codexInvoker{
+		addDirs:         []string{"/repo", "/agency"},
+		apiModel:        "gpt-5.5",
+		reasoningEffort: "medium",
+	}
+
+	got := invoker.Args("", "")
+	want := []string{
+		"codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write",
+		"--model", "gpt-5.5",
+		"--config", `model_reasoning_effort="medium"`,
+		"--add-dir", "/repo",
+		"--add-dir", "/agency",
+		"-",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("codex args mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestCodexInvokerAddsProviderModelWhenResuming(t *testing.T) {
+	invoker := &codexInvoker{
+		apiModel:        "gpt-5.5",
+		reasoningEffort: "medium",
+	}
+
+	got := invoker.Args("", "session-123")
+	want := []string{
+		"codex", "exec", "resume",
+		"--model", "gpt-5.5",
+		"--config", `model_reasoning_effort="medium"`,
+		"session-123",
+		"-",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("codex resume args mismatch\nwant: %#v\n got: %#v", want, got)
+	}
+}
+
+func TestCodexInvokerParsesSessionID(t *testing.T) {
 	invoker := &codexInvoker{}
-	got := invoker.ParseSessionID("OpenAI Codex\nSession ID: sess-123\n")
-	if got != "sess-123" {
-		t.Fatalf("ParseSessionID() = %q, want %q", got, "sess-123")
+	output := "session id: 019e01cb-2146-79a3-ab34-54e799203721\n\ntokens used\n78,525\n"
+
+	if got := invoker.ParseSessionID(output); got != "019e01cb-2146-79a3-ab34-54e799203721" {
+		t.Fatalf("ParseSessionID = %q", got)
 	}
 }
 
-func TestCodexInvokerParseLowercaseSessionID(t *testing.T) {
-	invoker := &codexInvoker{}
-	got := invoker.ParseSessionID("OpenAI Codex\nsession id: 019e0262-618f-7d80-9a6d-fb5ed664ccaa\n")
-	if got != "019e0262-618f-7d80-9a6d-fb5ed664ccaa" {
-		t.Fatalf("ParseSessionID() = %q", got)
+func TestNormaliseCodexReasoningEffort(t *testing.T) {
+	cases := map[string]string{
+		"MEDIUM": "medium",
+		"xhigh":  "xhigh",
+		"fast":   "",
 	}
-}
-
-func TestCodexResumeMissingRolloutError(t *testing.T) {
-	output := "Error: thread/resume: thread/resume failed: no rollout found for thread id 019e0262-618f-7d80-9a6d-fb5ed664ccaa"
-	if !isCodexResumeMissingRolloutError(output) {
-		t.Fatal("expected missing rollout error to be detected")
-	}
-}
-
-func TestDiscardSessionIDOnFailure(t *testing.T) {
-	if !discardSessionIDOnFailure(entity.ModelCodex) {
-		t.Fatal("expected codex failed sessions to be discarded")
-	}
-	if discardSessionIDOnFailure(entity.ModelClaudeCode) {
-		t.Fatal("did not expect claude failed sessions to be discarded")
+	for input, want := range cases {
+		if got := normaliseCodexReasoningEffort(input); got != want {
+			t.Fatalf("normaliseCodexReasoningEffort(%q) = %q, want %q", input, got, want)
+		}
 	}
 }

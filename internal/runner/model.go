@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/chenhg5/agencycli/internal/entity"
+	"github.com/chenhg5/agencycli/internal/telemetry"
 )
 
 // ModelInvoker knows how to invoke a specific agent model CLI.
@@ -27,15 +28,17 @@ type ModelInvoker interface {
 // InvokerFor returns the ModelInvoker for the given model.
 // If the model has a custom runCommand (from AgentMeta), it takes precedence.
 // addDirs lists additional directories to expose to the agent (model-specific flags).
-func InvokerFor(model entity.AgentModel, runCommand string, addDirs []string) ModelInvoker {
+// apiModel 是 provider/env 解析后的真实 API 模型名。
+// reasoningEffort 会传给支持“推理深度”配置的 CLI，避免后台任务误用用户本机默认值。
+func InvokerFor(model entity.AgentModel, runCommand string, addDirs []string, apiModel string, reasoningEffort string) ModelInvoker {
 	if runCommand != "" {
 		return &customInvoker{tmpl: runCommand}
 	}
 	switch entity.NormaliseModel(model) {
 	case entity.ModelClaudeCode:
-		return &claudeInvoker{addDirs: addDirs}
+		return &claudeInvoker{addDirs: addDirs, apiModel: apiModel}
 	case entity.ModelCodex:
-		return &codexInvoker{addDirs: addDirs}
+		return &codexInvoker{addDirs: addDirs, apiModel: apiModel, reasoningEffort: reasoningEffort}
 	case entity.ModelGemini:
 		return &geminiInvoker{addDirs: addDirs}
 	case entity.ModelOpenCode:
@@ -50,7 +53,8 @@ func InvokerFor(model entity.AgentModel, runCommand string, addDirs []string) Mo
 // ── Claude Code ───────────────────────────────────────────────────────────────
 
 type claudeInvoker struct {
-	addDirs []string
+	addDirs  []string
+	apiModel string
 }
 
 func (c *claudeInvoker) Args(promptFile, sessionID string) []string {
@@ -68,6 +72,9 @@ func (c *claudeInvoker) Args(promptFile, sessionID string) []string {
 	}
 	if sessionID != "" {
 		args = append(args, "--resume", sessionID)
+	}
+	if model := strings.TrimSpace(c.apiModel); model != "" {
+		args = append(args, "--model", model)
 	}
 	for _, dir := range c.addDirs {
 		args = append(args, "--add-dir", dir)
@@ -102,7 +109,9 @@ func (c *claudeInvoker) ParseSessionID(output string) string {
 // ── Codex ─────────────────────────────────────────────────────────────────────
 
 type codexInvoker struct {
-	addDirs []string
+	addDirs         []string
+	apiModel        string
+	reasoningEffort string
 }
 
 func (c *codexInvoker) Args(promptFile, sessionID string) []string {
@@ -110,38 +119,52 @@ func (c *codexInvoker) Args(promptFile, sessionID string) []string {
 	// --skip-git-repo-check allows running outside a git repo (agent workspace
 	// dirs are not git repos themselves; the project repo is mounted separately).
 	// When sessionID is provided, use `codex exec resume` to continue a session.
+	//
+	// provider.model 解析出来后必须显式传给 Codex CLI。Codex CLI 不会稳定地读取
+	// OPENAI_MODEL/CODEX_MODEL 环境变量；如果不加 --model，它会回落到用户本机
+	// config.toml 的默认模型，导致 Agency 中配置的 provider.model 被绕过。
+	//
+	// reasoning effort 也用 CLI config 显式覆盖。自动调度任务通常需要稳定产出，
+	// 不适合继承用户本机 xhigh 这类高成本设置；否则 PM 盘点大项目时很容易把
+	// token 和上游通道耗尽，表现为 streaming 重试或 503 distributor 不可用。
 	var args []string
 	if sessionID != "" {
-		// --add-dir must appear between "exec" and "resume"
-		args = []string{"codex", "exec"}
-		for _, dir := range c.addDirs {
-			args = append(args, "--add-dir", dir)
-		}
-		args = append(args, "resume", sessionID)
+		args = []string{"codex", "exec", "resume"}
+		args = c.appendModelArg(args)
+		args = c.appendReasoningEffortConfig(args)
+		args = append(args, sessionID)
 	} else {
-		args = []string{"codex", "exec", "--skip-git-repo-check"}
-		for _, dir := range c.addDirs {
-			args = append(args, "--add-dir", dir)
-		}
+		args = []string{"codex", "exec", "--skip-git-repo-check", "--sandbox", "workspace-write"}
+		args = c.appendModelArg(args)
+		args = c.appendReasoningEffortConfig(args)
+	}
+	for _, dir := range c.addDirs {
+		args = append(args, "--add-dir", dir)
 	}
 	args = append(args, "-")
 	return args
 }
 
+func (c *codexInvoker) appendModelArg(args []string) []string {
+	model := strings.TrimSpace(c.apiModel)
+	if model == "" {
+		return args
+	}
+	return append(args, "--model", model)
+}
+
+func (c *codexInvoker) appendReasoningEffortConfig(args []string) []string {
+	effort := strings.TrimSpace(c.reasoningEffort)
+	if effort == "" {
+		return args
+	}
+	return append(args, "--config", `model_reasoning_effort="`+effort+`"`)
+}
+
 func (c *codexInvoker) UseStdinPrompt() bool { return true }
 
 func (c *codexInvoker) ParseSessionID(output string) string {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		lower := strings.ToLower(line)
-		for _, prefix := range []string{"session id:", "session:", "session :"} {
-			if after, ok := strings.CutPrefix(lower, prefix); ok {
-				start := len(line) - len(after)
-				return strings.TrimSpace(line[start:])
-			}
-		}
-	}
-	return ""
+	return telemetry.CodexSessionIDFromLog([]byte(output))
 }
 
 // ── Gemini ────────────────────────────────────────────────────────────────────

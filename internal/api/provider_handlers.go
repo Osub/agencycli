@@ -13,12 +13,13 @@ import (
 // Separate from entity.APIProvider because APIKey uses json:"-" on the entity
 // to prevent leaking in responses, but we need to accept it in requests.
 type providerBody struct {
-	Name    string            `json:"name"`
-	Type    string            `json:"type"`
-	BaseURL string            `json:"baseUrl"`
-	APIKey  string            `json:"apiKey"`
-	Model   string            `json:"model"`
-	Env     map[string]string `json:"env,omitempty"`
+	Name    string                 `json:"name"`
+	Type    string                 `json:"type"`
+	BaseURL string                 `json:"baseUrl"`
+	APIKey  string                 `json:"apiKey"`
+	Model   string                 `json:"model"`
+	Env     map[string]string      `json:"env,omitempty"`
+	Pricing entity.ProviderPricing `json:"pricing,omitempty"`
 }
 
 func (b providerBody) toEntity() entity.APIProvider {
@@ -29,6 +30,7 @@ func (b providerBody) toEntity() entity.APIProvider {
 		APIKey:  strings.TrimSpace(b.APIKey),
 		Model:   strings.TrimSpace(b.Model),
 		Env:     b.Env,
+		Pricing: b.Pricing,
 	}
 }
 
@@ -119,6 +121,7 @@ func providerToJSON(p entity.APIProvider) map[string]any {
 		"baseUrl": p.BaseURL,
 		"model":   p.Model,
 		"hasKey":  p.APIKey != "",
+		"pricing": p.Pricing,
 	}
 	if len(p.Env) > 0 {
 		out["env"] = p.Env

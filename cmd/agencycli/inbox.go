@@ -71,6 +71,74 @@ func validateIdentity(ts taskstore.Store, identity, fieldName string) error {
 	return fmt.Errorf("unknown %s %q (hint: use 'human' or 'project/agent' format, e.g. cc-connect/pm)", fieldName, identity)
 }
 
+func defaultInboxSender(root string) string {
+	project, agentName := defaultAgentScope(root, "", "")
+	if project != "" && agentName != "" {
+		return project + "/" + agentName
+	}
+	return "human"
+}
+
+func normalizeInboxIdentity(ts taskstore.Store, root, identity string) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" || identity == "human" || strings.Contains(identity, "/") {
+		return identity
+	}
+
+	project := defaultProjectScope(root, "")
+	if project == "" {
+		return identity
+	}
+
+	fs, ok := ts.(*taskstore.FSStore)
+	if !ok {
+		return identity
+	}
+	agents, err := fs.ListAgents(project)
+	if err == nil && slices.Contains(agents, identity) {
+		return project + "/" + identity
+	}
+	return identity
+}
+
+func defaultInboxRecipient(ts taskstore.Store, root, recipient, project, agentName string) string {
+	if strings.TrimSpace(recipient) != "" {
+		return normalizeInboxIdentity(ts, root, recipient)
+	}
+	project, agentName = defaultAgentScope(root, project, agentName)
+	if project != "" && agentName != "" {
+		return project + "/" + agentName
+	}
+	return "human"
+}
+
+func allMessageRecipients(ts taskstore.Store) []string {
+	recipients := []string{"human"}
+	projects, _ := ts.ListProjects()
+	for _, proj := range projects {
+		agents, _ := ts.ListAgents(proj)
+		for _, ag := range agents {
+			recipients = append(recipients, proj+"/"+ag)
+		}
+	}
+	return recipients
+}
+
+func findMessageRecipient(ts taskstore.Store, msgID string) (string, error) {
+	for _, recipient := range allMessageRecipients(ts) {
+		msgs, err := ts.ListAllMessages(recipient)
+		if err != nil {
+			continue
+		}
+		for _, m := range msgs {
+			if m.ID == msgID {
+				return recipient, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("message %q not found", msgID)
+}
+
 func newInboxCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inbox",
@@ -101,9 +169,12 @@ Use 'inbox reply' to respond to messages or 'inbox forward' to route elsewhere.`
 
 func newInboxListCmd() *cobra.Command {
 	var (
-		recipient string
+		recipient  string
+		project    string
+		agentName  string
+		all        bool
 		unreadOnly bool
-		jsonOut   bool
+		jsonOut    bool
 	)
 
 	cmd := &cobra.Command{
@@ -122,9 +193,9 @@ Use --all to show all messages including read ones.`,
 			}
 			ts := taskstore.New(root)
 
-			recip := recipient
-			if recip == "" {
-				recip = "human"
+			recip := defaultInboxRecipient(ts, root, recipient, project, agentName)
+			if err := validateRecipient(ts, recip); err != nil {
+				return err
 			}
 
 			var msgs []*entity.Message
@@ -182,8 +253,12 @@ Use --all to show all messages including read ones.`,
 		},
 	}
 	cmd.Flags().StringVar(&recipient, "recipient", "", "mailbox to inspect: 'human' (default) or 'project/agent'")
+	cmd.Flags().StringVar(&project, "project", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().StringVar(&agentName, "agent", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().BoolVar(&all, "all", false, "show all messages including read ones")
 	cmd.Flags().BoolVar(&unreadOnly, "unread-only", false, "show only unread messages")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")
+	cmd.Flags().Lookup("all").Hidden = true
 	return cmd
 }
 
@@ -502,6 +577,7 @@ func newInboxSendCmd() *cobra.Command {
 		to      []string
 		subject string
 		body    string
+		message string
 		replyTo string
 		from    string
 	)
@@ -521,6 +597,9 @@ Examples:
   # Single recipient
   agencycli inbox send --to cc-connect/pm --body "..."
 
+  # From an agent workspace, --from is inferred from the current project/agent
+  agencycli inbox send --to pm --body "..."
+
   # Group send (repeat --to)
   agencycli inbox send --to cc-connect/pm --to cc-connect/dev-claude --to human --body "..."`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -528,23 +607,31 @@ Examples:
 			if err != nil {
 				return err
 			}
+			if body != "" && message != "" && body != message {
+				return fmt.Errorf("--body and --message both set different values; use only --body")
+			}
 			if body == "" {
-				return fmt.Errorf("--body is required")
+				body = message
+			}
+			if body == "" {
+				return fmt.Errorf("--body is required (compatibility alias: --message)")
 			}
 			if len(to) == 0 {
 				return fmt.Errorf("--to is required")
 			}
 			if from == "" {
-				return fmt.Errorf("--from is required")
+				from = defaultInboxSender(root)
 			}
-			sender := from
 			ts := taskstore.New(root)
+			sender := normalizeInboxIdentity(ts, root, from)
 
 			// Validate from and to identities exist
 			if err := validateIdentity(ts, sender, "from"); err != nil {
 				return err
 			}
-			for _, recipient := range to {
+			for i, recipient := range to {
+				recipient = normalizeInboxIdentity(ts, root, recipient)
+				to[i] = recipient
 				if err := validateIdentity(ts, recipient, "to"); err != nil {
 					return err
 				}
@@ -578,10 +665,10 @@ Examples:
 	cmd.Flags().StringArrayVar(&to, "to", nil, "recipient: 'human' or 'project/agent' (repeatable for group send)")
 	cmd.Flags().StringVar(&subject, "subject", "", "optional subject line")
 	cmd.Flags().StringVar(&body, "body", "", "message body")
+	cmd.Flags().StringVar(&message, "message", "", "compatibility alias for --body")
 	cmd.Flags().StringVar(&replyTo, "reply-to", "", "ID of message being replied to")
-	cmd.Flags().StringVar(&from, "from", "", "sender identity: 'human' or 'project/agent'")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity: 'human' or 'project/agent' (default: current agent, otherwise human)")
 	_ = cmd.MarkFlagRequired("to")
-	_ = cmd.MarkFlagRequired("from")
 	return cmd
 }
 
@@ -590,6 +677,8 @@ Examples:
 func newInboxMessagesCmd() *cobra.Command {
 	var (
 		recipient string
+		project   string
+		agentName string
 		from      string
 		all       bool
 		archived  bool
@@ -612,10 +701,8 @@ Use --archived to show archived messages.`,
 			if err != nil {
 				return err
 			}
-			if recipient == "" {
-				recipient = "human"
-			}
 			ts := taskstore.New(root)
+			recipient = defaultInboxRecipient(ts, root, recipient, project, agentName)
 			if err := validateRecipient(ts, recipient); err != nil {
 				return err
 			}
@@ -640,6 +727,7 @@ Use --archived to show archived messages.`,
 			}
 
 			if from != "" {
+				from = normalizeInboxIdentity(ts, root, from)
 				filtered := msgs[:0]
 				for _, m := range msgs {
 					if m.From == from {
@@ -694,6 +782,8 @@ Use --archived to show archived messages.`,
 	}
 
 	cmd.Flags().StringVar(&recipient, "recipient", "", "mailbox to inspect: 'human' (default) or 'project/agent'")
+	cmd.Flags().StringVar(&project, "project", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().StringVar(&agentName, "agent", "", "compatibility shortcut for --recipient <project>/<agent>")
 	cmd.Flags().StringVar(&from, "from", "", "filter by sender: 'human' or 'project/agent' (e.g. cc-connect/pm)")
 	cmd.Flags().BoolVar(&all, "all", false, "show all messages including already-read ones")
 	cmd.Flags().BoolVar(&archived, "archived", false, "show only archived messages")
@@ -706,8 +796,8 @@ Use --archived to show archived messages.`,
 
 func newInboxReplyCmd() *cobra.Command {
 	var (
-		body      string
-		from      string
+		body string
+		from string
 	)
 
 	cmd := &cobra.Command{
@@ -918,7 +1008,11 @@ Supports group forward by repeating --to.
 // ── inbox read ────────────────────────────────────────────────────────────────
 
 func newInboxReadCmd() *cobra.Command {
-	var recipient string
+	var (
+		recipient string
+		project   string
+		agentName string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "read <msg-id>",
@@ -929,28 +1023,42 @@ func newInboxReadCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if recipient == "" {
-				recipient = "human"
-			}
 			ts := taskstore.New(root)
+			recipient = defaultInboxRecipient(ts, root, recipient, project, agentName)
 			if err := validateRecipient(ts, recipient); err != nil {
 				return err
 			}
 			if err := ts.MarkMessageRead(recipient, args[0]); err != nil {
-				return err
+				if !strings.Contains(err.Error(), "not found") {
+					return err
+				}
+				foundRecipient, findErr := findMessageRecipient(ts, args[0])
+				if findErr != nil {
+					return err
+				}
+				recipient = foundRecipient
+				if err := ts.MarkMessageRead(recipient, args[0]); err != nil {
+					return err
+				}
 			}
-			fmt.Printf("✓ Message %s marked as read\n", args[0])
+			fmt.Printf("✓ Message %s marked as read  [%s]\n", args[0], recipient)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&recipient, "recipient", "", "mailbox: 'human' (default) or 'project/agent'")
+	cmd.Flags().StringVar(&project, "project", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().StringVar(&agentName, "agent", "", "compatibility shortcut for --recipient <project>/<agent>")
 	return cmd
 }
 
 // ── inbox archive ─────────────────────────────────────────────────────────────
 
 func newInboxArchiveCmd() *cobra.Command {
-	var recipient string
+	var (
+		recipient string
+		project   string
+		agentName string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "archive <msg-id>",
@@ -961,29 +1069,43 @@ func newInboxArchiveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if recipient == "" {
-				recipient = "human"
-			}
 			ts := taskstore.New(root)
+			recipient = defaultInboxRecipient(ts, root, recipient, project, agentName)
 			if err := validateRecipient(ts, recipient); err != nil {
 				return err
 			}
 			if err := ts.ArchiveMessage(recipient, args[0]); err != nil {
-				return err
+				if !strings.Contains(err.Error(), "not found") {
+					return err
+				}
+				foundRecipient, findErr := findMessageRecipient(ts, args[0])
+				if findErr != nil {
+					return err
+				}
+				recipient = foundRecipient
+				if err := ts.ArchiveMessage(recipient, args[0]); err != nil {
+					return err
+				}
 			}
-			fmt.Printf("✓ Message %s archived\n", args[0])
+			fmt.Printf("✓ Message %s archived  [%s]\n", args[0], recipient)
 			fmt.Printf("  View archived messages: agencycli inbox messages --archived\n")
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&recipient, "recipient", "", "mailbox: 'human' (default) or 'project/agent'")
+	cmd.Flags().StringVar(&project, "project", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().StringVar(&agentName, "agent", "", "compatibility shortcut for --recipient <project>/<agent>")
 	return cmd
 }
 
 // ── inbox delete ──────────────────────────────────────────────────────────────
 
 func newInboxDeleteCmd() *cobra.Command {
-	var recipient string
+	var (
+		recipient string
+		project   string
+		agentName string
+	)
 
 	cmd := &cobra.Command{
 		Use:     "delete <msg-id>",
@@ -995,21 +1117,31 @@ func newInboxDeleteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if recipient == "" {
-				recipient = "human"
-			}
 			ts := taskstore.New(root)
+			recipient = defaultInboxRecipient(ts, root, recipient, project, agentName)
 			if err := validateRecipient(ts, recipient); err != nil {
 				return err
 			}
 			if err := ts.DeleteMessage(recipient, args[0]); err != nil {
-				return err
+				if !strings.Contains(err.Error(), "not found") {
+					return err
+				}
+				foundRecipient, findErr := findMessageRecipient(ts, args[0])
+				if findErr != nil {
+					return err
+				}
+				recipient = foundRecipient
+				if err := ts.DeleteMessage(recipient, args[0]); err != nil {
+					return err
+				}
 			}
-			fmt.Printf("✓ Message %s deleted\n", args[0])
+			fmt.Printf("✓ Message %s deleted  [%s]\n", args[0], recipient)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&recipient, "recipient", "", "mailbox: 'human' (default) or 'project/agent'")
+	cmd.Flags().StringVar(&project, "project", "", "compatibility shortcut for --recipient <project>/<agent>")
+	cmd.Flags().StringVar(&agentName, "agent", "", "compatibility shortcut for --recipient <project>/<agent>")
 	return cmd
 }
 

@@ -10,6 +10,7 @@ package runner
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -20,6 +21,9 @@ import (
 	"time"
 
 	"github.com/chenhg5/agencycli/internal/entity"
+	"github.com/chenhg5/agencycli/internal/lessons"
+	"github.com/chenhg5/agencycli/internal/memory"
+	"github.com/chenhg5/agencycli/internal/runtimeenv"
 	"github.com/chenhg5/agencycli/internal/sandbox"
 	"github.com/chenhg5/agencycli/internal/store"
 	"github.com/chenhg5/agencycli/internal/taskstore"
@@ -46,15 +50,21 @@ Task ID : %s
 Agent   : %s/%s
 
 When complete successfully, run:
-  agencycli task done --id %s --status success
+  "${AGENCYCLI_BIN:-agencycli}" task done --id %s --status success
 
 If human confirmation needed, run:
-  agencycli task confirm-request --id %s --summary "one-line explanation"
+  "${AGENCYCLI_BIN:-agencycli}" task confirm-request --id %s --summary "one-line explanation"
   (then exit 0)
 
 If unable to complete, run:
-  agencycli task done --id %s --status failed --error "reason"
-`
+  "${AGENCYCLI_BIN:-agencycli}" task done --id %s --status failed --error "reason"
+
+If you learned a reusable workflow, convention, pitfall, or validation pattern
+that should help future agents, include one concise lesson block in your final
+output:
+
+AGENCYCLI_LESSON_BEGIN
+# Short reusable lesson title
 
 // Runner executes tasks for agents using their configured CLI.
 type Runner struct {
@@ -75,6 +85,14 @@ type RunResult struct {
 	LogPath   string
 	Summary   string // set when Status == TaskStatusAwaitingConfirmation
 	ErrorMsg  string // set when Status == TaskStatusDoneFailed
+	// PromptBytes is the UTF-8 byte length of the final prompt sent to the model.
+	PromptBytes int64
+	// MemorySnippets is the number of retrieved memory snippets injected.
+	MemorySnippets int
+	// MemoryWarnings captures non-fatal retrieval warnings from memory sources.
+	MemoryWarnings []string
+	// LessonPaths lists captured reusable lesson files generated from output.
+	LessonPaths []string
 }
 
 // ExecPrompt runs a raw prompt against an agent directly, bypassing the task
@@ -90,16 +108,34 @@ type RunResult struct {
 // to resume. The returned RunResult contains the detected session ID (if any)
 // and the log path.
 func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunResult, error) {
+	return r.execPrompt(project, agentName, prompt, sessionID, nil)
+}
+
+// ExecPromptWithEnv is like ExecPrompt, but applies temporary environment
+// overrides only for this execution. This is useful for A/B tests where the
+// same prompt should run under slightly different retrieval settings.
+func (r *Runner) ExecPromptWithEnv(project, agentName, prompt, sessionID string, envOverride map[string]string) (*RunResult, error) {
+	return r.execPrompt(project, agentName, prompt, sessionID, envOverride)
+}
+
+func (r *Runner) execPrompt(project, agentName, prompt, sessionID string, envOverride map[string]string) (*RunResult, error) {
 	meta, err := r.agentStore.AgentMeta(project, agentName)
 	if err != nil {
 		return nil, fmt.Errorf("load agent meta: %w", err)
 	}
 
 	agentDir := filepath.Join(r.root, "projects", project, "agents", agentName)
+	model := entity.NormaliseModel(meta.Model)
+	agentEnv := resolveProviderEnv(r.root, meta)
+	for k, v := range envOverride {
+		agentEnv[k] = v
+	}
+	effectiveEnv := runtimeenv.WithAgencycliEnv(mergeEnv(os.Environ(), agentEnv), r.root)
+	prompt, memoryResult := r.injectMemoryContext(project, agentName, "", "", prompt, effectiveEnv)
 
 	// HTTP agent: bypass CLI subprocess.
-	if entity.NormaliseModel(meta.Model) == entity.ModelHTTPAgent {
-		return r.execPromptHTTP(agentDir, meta, prompt)
+	if model == entity.ModelHTTPAgent {
+		return r.execPromptHTTP(agentDir, meta, prompt, memoryResult)
 	}
 
 	// Write prompt to a temp file.
@@ -109,11 +145,13 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 	}
 	defer os.Remove(promptFile)
 
-	model := entity.NormaliseModel(meta.Model)
-	agentEnv := resolveProviderEnv(r.root, meta)
-	effectiveEnv := mergeEnv(os.Environ(), agentEnv)
 	apiModel, apiBaseURL := resolveAPIModelFromEnv(model, effectiveEnv)
-	invoker := InvokerFor(model, meta.RunCommand, meta.AddDirs)
+	reasoningEffort := resolveReasoningEffortFromEnv(model, effectiveEnv)
+	// 将 Agency 工作区作为额外可访问目录传给模型 CLI。
+	// Codex/Claude/Gemini 自身还有一层文件沙箱：即使外层 scheduler 有权限，
+	// 如果没有把工作区显式加入 add-dir，PM Agent 也只能写自己的 agent 目录，
+	// 无法通过 `agencycli task add` 给 dev/qa/ops/security 写入任务队列。
+	invoker := InvokerFor(model, meta.RunCommand, agentCLIAddDirs(meta.AddDirs, r.root), apiModel, reasoningEffort)
 	innerArgs := invoker.Args(promptFile, sessionID)
 
 	var (
@@ -128,6 +166,7 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 		}
 		dockerCfg := cloneDockerCfg(meta.Sandbox.Docker)
 		injectProviderEnvIntoDocker(dockerCfg, agentEnv)
+		injectAgencycliDockerEnv(dockerCfg)
 		for _, addDir := range meta.AddDirs {
 			absDir, err := filepath.Abs(addDir)
 			if err != nil {
@@ -177,6 +216,7 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 	fmt.Fprintf(logFile, "=== agencycli exec: %s/%s sandbox=%s ===\n", project, agentName, sandboxLabel)
 	fmt.Fprintf(logFile, "Command: %s\n", telemetry.FormatExecCommand(executable, args))
 	fmt.Fprintf(logFile, "Started: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	writeMemoryLog(logFile, memoryResult)
 
 	// Stream output to stdout AND the log file simultaneously.
 	cmd := exec.Command(executable, args...)
@@ -211,7 +251,12 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 		cmd.ProcessState.ExitCode(), time.Now().UTC().Format(time.RFC3339))
 
 	output := outBuf.String()
-	result := &RunResult{LogPath: logPath}
+	result := &RunResult{
+		LogPath:        logPath,
+		PromptBytes:    int64(len([]byte(prompt))),
+		MemorySnippets: len(memoryResult.Snippets),
+		MemoryWarnings: append([]string(nil), memoryResult.Warnings...),
+	}
 
 	if sid := invoker.ParseSessionID(output); sid != "" {
 		result.SessionID = sid
@@ -239,7 +284,7 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 				"thinking block signature invalid, retrying fresh",
 				logPath, telemetry.FormatExecCommand(executable, args), prompt, outBuf.Bytes())
 			r.clearHeartbeatSession(project, agentName)
-			return r.ExecPrompt(project, agentName, prompt, "")
+			return r.execPrompt(project, agentName, prompt, "", envOverride)
 		}
 		if discardSessionIDOnFailure(model) {
 			result.SessionID = ""
@@ -248,6 +293,12 @@ func (r *Runner) ExecPrompt(project, agentName, prompt, sessionID string) (*RunR
 		result.ErrorMsg = buildErrorMsg(runErr, outBuf.Bytes())
 	} else {
 		result.Status = entity.TaskStatusDoneSuccess
+	}
+	if result.Status == entity.TaskStatusDoneSuccess {
+		if failure, ok := telemetry.DetectModelToolFailure(outBuf.Bytes()); ok {
+			result.Status = entity.TaskStatusDoneFailed
+			result.ErrorMsg = "model tool failure despite zero CLI exit:\n" + failure.Message
+		}
 	}
 	r.recordAgentRun(telemetry.KindExec, project, agentName, "", "", string(model), sandboxLabel,
 		apiModel, apiBaseURL,
@@ -273,13 +324,19 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 	}
 
 	agentDir := filepath.Join(r.root, "projects", project, "agents", agentName)
+	model := entity.NormaliseModel(meta.Model)
+	agentEnv := resolveProviderEnv(r.root, meta)
+	effectiveEnv := runtimeenv.WithAgencycliEnv(mergeEnv(os.Environ(), agentEnv), r.root)
+	taskPrompt, memoryResult := r.injectMemoryContext(
+		project, agentName, task.ID, task.Title, task.Prompt, effectiveEnv,
+	)
 
 	// HTTP agent: bypass CLI subprocess, send prompt to HTTP endpoint directly.
-	if entity.NormaliseModel(meta.Model) == entity.ModelHTTPAgent {
-		return r.runTaskHTTP(project, agentName, agentDir, meta, task)
+	if model == entity.ModelHTTPAgent {
+		return r.runTaskHTTP(project, agentName, agentDir, meta, task, taskPrompt, memoryResult)
 	}
 
-	fullPrompt := task.Prompt + fmt.Sprintf(systemMetaFooter,
+	fullPrompt := taskPrompt + fmt.Sprintf(systemMetaFooter,
 		task.ID, project, agentName, task.ID, task.ID, task.ID)
 
 	// Write prompt to a temp file (avoids shell escaping issues).
@@ -289,11 +346,11 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 	}
 	defer os.Remove(promptFile)
 
-	model := entity.NormaliseModel(meta.Model)
-	agentEnv := resolveProviderEnv(r.root, meta)
-	effectiveEnv := mergeEnv(os.Environ(), agentEnv)
 	apiModel, apiBaseURL := resolveAPIModelFromEnv(model, effectiveEnv)
-	invoker := InvokerFor(model, meta.RunCommand, meta.AddDirs)
+	reasoningEffort := resolveReasoningEffortFromEnv(model, effectiveEnv)
+	// 任务执行同样需要把 Agency 工作区暴露给模型 CLI，确保 Agent 可以写入
+	// workspace 级 inbox、里程碑，以及兄弟 Agent 的任务队列。
+	invoker := InvokerFor(model, meta.RunCommand, agentCLIAddDirs(meta.AddDirs, r.root), apiModel, reasoningEffort)
 
 	// Build the inner agent CLI arguments.
 	innerArgs := invoker.Args(promptFile, sessionID)
@@ -317,6 +374,7 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 		// mutating the original AgentMeta.
 		dockerCfg := cloneDockerCfg(meta.Sandbox.Docker)
 		injectProviderEnvIntoDocker(dockerCfg, agentEnv)
+		injectAgencycliDockerEnv(dockerCfg)
 
 		// Auto-mount the project's code repository at the same absolute path
 		// inside the container. This lets the agent read/write/commit code at
@@ -387,6 +445,7 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 		project, agentName, task.ID, sandboxLabel)
 	fmt.Fprintf(logFile, "Command: %s\n", telemetry.FormatExecCommand(executable, args))
 	fmt.Fprintf(logFile, "Started: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	writeMemoryLog(logFile, memoryResult)
 
 	// Run the agent.
 	cmd := exec.Command(executable, args...)
@@ -417,7 +476,12 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 		cmd.ProcessState.ExitCode(), time.Now().UTC().Format(time.RFC3339))
 
 	output := outBuf.String()
-	result := &RunResult{LogPath: logPath}
+	result := &RunResult{
+		LogPath:        logPath,
+		PromptBytes:    int64(len([]byte(fullPrompt))),
+		MemorySnippets: len(memoryResult.Snippets),
+		MemoryWarnings: append([]string(nil), memoryResult.Warnings...),
+	}
 
 	// Parse session ID (model-specific + universal sentinel).
 	if sid := invoker.ParseSessionID(output); sid != "" {
@@ -434,6 +498,7 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 	if summary := parseLineSentinel(output, ConfirmSentinel); summary != "" {
 		result.Status = entity.TaskStatusAwaitingConfirmation
 		result.Summary = strings.TrimSpace(summary)
+		r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 		r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, string(model), sandboxLabel,
 			apiModel, apiBaseURL,
 			runStarted, runFinished, result.Status, &ec, result.SessionID, result.ErrorMsg,
@@ -467,6 +532,7 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 		}
 		result.Status = entity.TaskStatusDoneFailed
 		result.ErrorMsg = buildErrorMsg(runErr, outBuf.Bytes())
+		r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 		r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, string(model), sandboxLabel,
 			apiModel, apiBaseURL,
 			runStarted, runFinished, result.Status, &ec, result.SessionID, result.ErrorMsg,
@@ -474,7 +540,26 @@ func (r *Runner) RunTask(project, agentName string, task *entity.Task, sessionID
 		return result, runErr
 	}
 
-	result.Status = entity.TaskStatusDoneSuccess
+	explicitTerminalStatus := false
+	if fresh, ferr := r.ts.GetTask(project, agentName, task.ID); ferr == nil {
+		switch fresh.Status {
+		case entity.TaskStatusDoneSuccess, entity.TaskStatusDoneFailed, entity.TaskStatusAwaitingConfirmation:
+			explicitTerminalStatus = true
+			result.Status = fresh.Status
+			result.ErrorMsg = fresh.LastError
+			result.Summary = fresh.Summary
+		}
+	}
+	if result.Status == "" {
+		result.Status = entity.TaskStatusDoneSuccess
+	}
+	if !explicitTerminalStatus && result.Status == entity.TaskStatusDoneSuccess {
+		if failure, ok := telemetry.DetectModelToolFailure(outBuf.Bytes()); ok {
+			result.Status = entity.TaskStatusDoneFailed
+			result.ErrorMsg = "model tool failure despite zero CLI exit:\n" + failure.Message
+		}
+	}
+	r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 	r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, string(model), sandboxLabel,
 		apiModel, apiBaseURL,
 		runStarted, runFinished, result.Status, &ec, result.SessionID, result.ErrorMsg,
@@ -492,6 +577,26 @@ func (r *Runner) ResumeTask(project, agentName string, task *entity.Task, confir
 	result, err := r.RunTask(project, agentName, task, sessionID)
 	task.Prompt = original // restore
 	return result, err
+}
+
+func (r *Runner) captureTaskLessons(project, agentName string, task *entity.Task, result *RunResult, output string, createdAt time.Time) {
+	if result == nil || task == nil {
+		return
+	}
+	paths, err := lessons.CaptureFromOutput(r.root, lessons.CaptureInput{
+		Project:   project,
+		Agent:     agentName,
+		TaskID:    task.ID,
+		TaskTitle: task.Title,
+		Status:    string(result.Status),
+		LogPath:   result.LogPath,
+		CreatedAt: createdAt,
+	}, output)
+	if err != nil {
+		result.MemoryWarnings = append(result.MemoryWarnings, "lesson capture failed: "+err.Error())
+		return
+	}
+	result.LessonPaths = append(result.LessonPaths, paths...)
 }
 
 func isThinkingSignatureError(output string) bool {
@@ -691,7 +796,21 @@ func (r *Runner) recordAgentRun(
 		rec.ExitCode = sql.NullInt64{Int64: int64(*exitCode), Valid: true}
 	}
 	rec.PromptBytes, rec.PromptSHA256 = telemetry.PromptFingerprint(prompt)
-	telemetry.ApplyStreamUsage(&rec, telemetry.ParseStreamJSONUsage(stdout))
+	usage := telemetry.ParseLogUsage(stdout)
+	telemetry.ApplyStreamUsage(&rec, usage)
+	if usage.SawResult && !rec.HasCost {
+		priceModel := apiModel
+		if priceModel == "" {
+			priceModel = telemetry.ModelFromLog(stdout)
+		}
+		if priceModel == "" {
+			priceModel = modelNorm
+		}
+		if cost, ok := telemetry.EstimateCostUSDForRoot(r.root, priceModel, usage.InputTokens, usage.OutputTokens, usage.CacheReadTokens, usage.TotalOnly); ok {
+			rec.TotalCostUSD = sql.NullFloat64{Float64: cost, Valid: true}
+			rec.HasCost = true
+		}
+	}
 	_ = telemetry.Insert(r.root, rec)
 }
 
@@ -728,6 +847,42 @@ func resolveAPIModelFromEnv(modelType entity.AgentModel, env []string) (apiModel
 	return
 }
 
+// resolveReasoningEffortFromEnv 读取模型 CLI 的推理深度配置。
+//
+// 目前只有 Codex CLI 在这里需要显式覆盖，因为 Codex 会默认读取用户级
+// ~/.codex/config.toml；如果用户级配置是 xhigh，后台 scheduler 的长上下文任务
+// 容易变成高成本长流式请求。这里用环境变量让 Agency 可以按 provider/agent 粒度
+// 降低或提高推理深度，而不用修改用户本机 Codex 默认配置。
+func resolveReasoningEffortFromEnv(modelType entity.AgentModel, env []string) string {
+	lookup := func(keys ...string) string {
+		for i := len(env) - 1; i >= 0; i-- {
+			k, v, _ := strings.Cut(env[i], "=")
+			for _, want := range keys {
+				if k == want && v != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
+		return ""
+	}
+	switch modelType {
+	case entity.ModelCodex:
+		return normaliseCodexReasoningEffort(lookup("CODEX_MODEL_REASONING_EFFORT", "CODEX_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"))
+	default:
+		return ""
+	}
+}
+
+func normaliseCodexReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
+	case "minimal", "low", "medium", "high", "xhigh":
+		return effort
+	default:
+		return ""
+	}
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────────
 
 func writeTempPrompt(agentDir, content string) (string, error) {
@@ -746,6 +901,55 @@ func writeTempPrompt(agentDir, content string) (string, error) {
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+func (r *Runner) injectMemoryContext(project, agentName, taskID, taskTitle, prompt string, env []string) (string, memory.Result) {
+	result := memory.Retrieve(context.Background(), env, memory.Query{
+		Project:   project,
+		Agent:     agentName,
+		TaskID:    taskID,
+		TaskTitle: taskTitle,
+		Prompt:    prompt,
+	})
+	return memory.Inject(prompt, result), result
+}
+
+func writeMemoryLog(w io.Writer, result memory.Result) {
+	if len(result.Snippets) == 0 && len(result.Warnings) == 0 {
+		return
+	}
+	if len(result.Snippets) > 0 {
+		fmt.Fprintf(w, "Memory: injected %d retrieved snippet(s)\n", len(result.Snippets))
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(w, "Memory warning: %s\n", warning)
+	}
+	fmt.Fprintln(w)
+}
+
+// agentCLIAddDirs 返回模型 CLI 应获得访问权的额外目录。
+//
+// 这里不仅包含项目代码仓库，还必须包含 Agency 工作区根目录。原因是 PM、
+// QA、Security 等 Agent 会通过 `agencycli task add`、`agencycli inbox`
+// 协作；这些命令需要写入 `projects/<project>/agents/<peer>/.agencycli`
+// 和 workspace 级 `.agencycli`。如果不把 root 加进 Codex/Claude/Gemini
+// 的 add-dir，外层进程有权限也没用，内层模型沙箱仍会拒绝写入。
+func agentCLIAddDirs(addDirs []string, root string) []string {
+	out := make([]string, 0, len(addDirs)+1)
+	seen := map[string]bool{}
+	add := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	for _, dir := range addDirs {
+		add(dir)
+	}
+	add(root)
+	return out
 }
 
 // shellEscape returns a single-quoted string safe for use in a bash command.
@@ -805,12 +1009,18 @@ func cloneDockerCfg(cfg *entity.DockerSandboxConfig) *entity.DockerSandboxConfig
 // runTaskHTTP runs a task by posting the full prompt to the agent's HTTP
 // endpoint. The agent's context.md is sent as the system message; the task
 // prompt + system meta footer become the user message.
-func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.AgentMeta, task *entity.Task) (*RunResult, error) {
+func (r *Runner) runTaskHTTP(
+	project, agentName, agentDir string,
+	meta *entity.AgentMeta,
+	task *entity.Task,
+	taskPrompt string,
+	memoryResult memory.Result,
+) (*RunResult, error) {
 	if meta.HTTPAgent == nil {
 		return nil, fmt.Errorf("http-agent: no http_agent config in .agencycli-agent.yaml (re-hire with --http-url)")
 	}
 
-	userPrompt := task.Prompt + fmt.Sprintf(systemMetaFooter,
+	userPrompt := taskPrompt + fmt.Sprintf(systemMetaFooter,
 		task.ID, project, agentName, task.ID, task.ID, task.ID)
 
 	logDir, err := r.ts.RunLogDir(project, agentName)
@@ -828,6 +1038,7 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 	fmt.Fprintf(logFile, "=== agencycli run: %s/%s task=%s model=http-agent url=%s ===\n",
 		project, agentName, task.ID, meta.HTTPAgent.URL)
 	fmt.Fprintf(logFile, "Started: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	writeMemoryLog(logFile, memoryResult)
 
 	systemPrompt := readAgentContextFile(agentDir)
 	runStarted := time.Now()
@@ -836,7 +1047,12 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 
 	fmt.Fprintf(logFile, "\n=== finished: %s ===\n", time.Now().UTC().Format(time.RFC3339))
 
-	result := &RunResult{LogPath: logPath}
+	result := &RunResult{
+		LogPath:        logPath,
+		PromptBytes:    int64(len([]byte(userPrompt))),
+		MemorySnippets: len(memoryResult.Snippets),
+		MemoryWarnings: append([]string(nil), memoryResult.Warnings...),
+	}
 	httpSummary := httpCommandSummary(meta.HTTPAgent.URL)
 	modelNorm := string(entity.ModelHTTPAgent)
 	sandboxLabel := "host"
@@ -847,6 +1063,7 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 	if httpErr != nil {
 		result.Status = entity.TaskStatusDoneFailed
 		result.ErrorMsg = httpErr.Error()
+		r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 		r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, modelNorm, sandboxLabel,
 			"", "",
 			runStarted, runFinished, result.Status, nil, result.SessionID, result.ErrorMsg,
@@ -858,6 +1075,7 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 	if summary := parseLineSentinel(output, ConfirmSentinel); summary != "" {
 		result.Status = entity.TaskStatusAwaitingConfirmation
 		result.Summary = strings.TrimSpace(summary)
+		r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 		r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, modelNorm, sandboxLabel,
 			"", "",
 			runStarted, runFinished, result.Status, nil, result.SessionID, result.ErrorMsg,
@@ -869,6 +1087,7 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 	}
 
 	result.Status = entity.TaskStatusDoneSuccess
+	r.captureTaskLessons(project, agentName, task, result, output, runFinished)
 	r.recordAgentRun(telemetry.KindTask, project, agentName, task.ID, task.Title, modelNorm, sandboxLabel,
 		"", "",
 		runStarted, runFinished, result.Status, nil, result.SessionID, result.ErrorMsg,
@@ -878,7 +1097,7 @@ func (r *Runner) runTaskHTTP(project, agentName, agentDir string, meta *entity.A
 
 // execPromptHTTP handles ExecPrompt for http-agent: sends the raw prompt to
 // the HTTP endpoint and streams the response to stdout + log file.
-func (r *Runner) execPromptHTTP(agentDir string, meta *entity.AgentMeta, prompt string) (*RunResult, error) {
+func (r *Runner) execPromptHTTP(agentDir string, meta *entity.AgentMeta, prompt string, memoryResult memory.Result) (*RunResult, error) {
 	if meta.HTTPAgent == nil {
 		return nil, fmt.Errorf("http-agent: no http_agent config in .agencycli-agent.yaml (re-hire with --http-url)")
 	}
@@ -898,6 +1117,7 @@ func (r *Runner) execPromptHTTP(agentDir string, meta *entity.AgentMeta, prompt 
 	fmt.Fprintf(logFile, "=== agencycli exec: %s/%s model=http-agent url=%s ===\n",
 		meta.Project, meta.Name, meta.HTTPAgent.URL)
 	fmt.Fprintf(logFile, "Started: %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	writeMemoryLog(logFile, memoryResult)
 
 	systemPrompt := readAgentContextFile(agentDir)
 	runStarted := time.Now()
@@ -906,7 +1126,12 @@ func (r *Runner) execPromptHTTP(agentDir string, meta *entity.AgentMeta, prompt 
 
 	fmt.Fprintf(logFile, "\n=== finished: %s ===\n", time.Now().UTC().Format(time.RFC3339))
 
-	result := &RunResult{LogPath: logPath}
+	result := &RunResult{
+		LogPath:        logPath,
+		PromptBytes:    int64(len([]byte(prompt))),
+		MemorySnippets: len(memoryResult.Snippets),
+		MemoryWarnings: append([]string(nil), memoryResult.Warnings...),
+	}
 	httpSummary := httpCommandSummary(meta.HTTPAgent.URL)
 	modelNorm := string(entity.ModelHTTPAgent)
 	sandboxLabel := "host"
@@ -995,6 +1220,10 @@ func injectProviderEnvIntoDocker(cfg *entity.DockerSandboxConfig, env map[string
 	for k, v := range env {
 		cfg.ExtraEnv = append(cfg.ExtraEnv, k+"="+v)
 	}
+}
+
+func injectAgencycliDockerEnv(cfg *entity.DockerSandboxConfig) {
+	cfg.ExtraEnv = append(cfg.ExtraEnv, runtimeenv.AgencycliBinEnv+"="+sandbox.AgencycliMount)
 }
 
 // mergeEnv returns a copy of base with the entries in override applied.

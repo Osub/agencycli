@@ -226,7 +226,7 @@ A well-written team prompt should cover:
 - <any other team-wide tools — e.g. `jq`, `docker`, `kubectl`>
 
 ## Team communication norms
-- <e.g. "The PM role coordinates task assignment — check in with pm before starting new work">
+- <e.g. "The PM role coordinates task assignment and keeps project knowledge, docs, and skills organized — check in with pm before starting new work">
 - <e.g. "QA must sign off on every feature PR before it is merged">
 - <e.g. "Post a brief status update to human inbox at the end of each work cycle">
 
@@ -324,7 +324,7 @@ Roles define a job function within a team. Each role has its own prompt layer an
 ```bash
 agencycli create role --team "engineering" --name "developer"   --desc "Implements features and fixes bugs"
 agencycli create role --team "qa"          --name "qa-engineer" --desc "Reviews PRs and tests"
-agencycli create role --team "product"     --name "pm"          --desc "Manages roadmap and tasks"
+agencycli create role --team "product"     --name "pm"          --desc "Manages roadmap, tasks, knowledge, docs, and skills"
 ```
 
 **Edit `teams/<team>/roles/<role>/prompt.md`** — this is the most important layer. It defines who this agent is, what it owns, how it works, where its files live, and what "done" means. **Write it fully before hiring any agent with this role.**
@@ -350,6 +350,7 @@ code and communicate proactively.">
 - <e.g. "Open a PR for every change; never commit directly to main">
 - <e.g. "Respond to PR review comments within your next active wakeup cycle">
 - <e.g. "Keep the PM informed of progress and blockers via inbox">
+- <For PM roles: keep reusable project knowledge, docs, and skills organized and current>
 
 ## Work scope and boundaries
 **You own:**

@@ -789,6 +789,7 @@ func runAllPendingTasks(ctx context.Context, root, project, agentName string,
 				} else {
 					wakeupTask.Status = result.Status
 					wakeupTask.RunLogPath = result.LogPath
+					logCapturedLessons(taskLog, result.LessonPaths)
 					// All statuses (including awaiting_confirmation) are archived.
 					// Human responds via `inbox reply`; agent continues on next wakeup.
 					_ = ts.ArchiveTask(project, agentName, wakeupTask)
@@ -883,6 +884,7 @@ func runAllPendingTasks(ctx context.Context, root, project, agentName string,
 		switch result.Status {
 		case entity.TaskStatusDoneSuccess:
 			taskLog("%s task %s done", colorGreen+"✓", task.ID)
+			logCapturedLessons(taskLog, result.LessonPaths)
 			_ = ts.ArchiveTask(project, agentName, task)
 			if len(task.OnSuccess) > 0 {
 				_ = fireOnSuccessTriggers(root, project, agentName, task)
@@ -891,6 +893,7 @@ func runAllPendingTasks(ctx context.Context, root, project, agentName string,
 		case entity.TaskStatusDoneFailed:
 			task.LastError = result.ErrorMsg
 			taskLog("%s task %s failed: %s", colorRed+"✗", task.ID, result.ErrorMsg)
+			logCapturedLessons(taskLog, result.LessonPaths)
 			if task.RetryCount < task.MaxRetries {
 				task.RetryCount++
 				task.Status = entity.TaskStatusPending
@@ -904,6 +907,7 @@ func runAllPendingTasks(ctx context.Context, root, project, agentName string,
 		case entity.TaskStatusAwaitingConfirmation:
 			// Archive the task. Human responds via `inbox reply`; agent continues
 			// on next wakeup using session memory.
+			logCapturedLessons(taskLog, result.LessonPaths)
 			_ = ts.ArchiveTask(project, agentName, task)
 			taskLog("%s task %s done (awaiting reply)", colorYellow+"?", task.ID)
 		}
@@ -921,6 +925,12 @@ func runAllPendingTasks(ctx context.Context, root, project, agentName string,
 // agentDir returns the filesystem path of an agent's workspace.
 func agentDir(root, project, agentName string) string {
 	return root + "/projects/" + project + "/agents/" + agentName
+}
+
+func logCapturedLessons(logf func(string, ...any), paths []string) {
+	for _, path := range paths {
+		logf("%s lesson captured: %s", colorGreen+"✓", path)
+	}
 }
 
 // ── i18n ─────────────────────────────────────────────────────────────────────

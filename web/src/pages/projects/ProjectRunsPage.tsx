@@ -62,6 +62,7 @@ type RunRow = {
   logPath?: string
   sessionId?: string
   errorMsg?: string
+  warningMsg?: string
   taskId?: string
   taskTitle?: string
 }
@@ -515,6 +516,12 @@ function RunDetailModal({ run, onClose }: { run: RunRow; onClose: () => void }) 
               </div>
             )
           })()}
+          {!run.errorMsg && run.warningMsg && (
+            <div className="col-span-full rounded-md border border-amber-200/60 bg-amber-50/60 p-3 dark:border-amber-800/40 dark:bg-amber-950/20">
+              <span className="text-xs font-medium text-amber-700 dark:text-amber-400">{t('runs.warningLabel')}</span>
+              <pre className="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-amber-800 dark:text-amber-300">{run.warningMsg}</pre>
+            </div>
+          )}
         </div>
 
         {/* Log content */}

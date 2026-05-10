@@ -37,7 +37,7 @@ type RunRow = {
   startedAt: string; finishedAt: string; model?: string
   taskId?: string; taskTitle?: string; logPath?: string
   inputTokens?: number; outputTokens?: number; cacheReadTokens?: number
-  costUSD?: number; errorMsg?: string; command?: string
+  costUSD?: number; errorMsg?: string; warningMsg?: string; command?: string
 }
 
 type LogData = { content: string; truncated: boolean }
@@ -278,6 +278,13 @@ export function TaskDetailModal({ task, onClose, onEdit }: { task: TaskRow; onCl
             <div className="mt-1.5 overflow-y-auto rounded-lg bg-emerald-50 p-3 text-sm text-neutral-700 dark:bg-emerald-900/20 dark:text-zinc-300">
               <div className="prose prose-sm max-w-none dark:prose-invert"><ReactMarkdown remarkPlugins={[remarkGfm]}>{task.summary}</ReactMarkdown></div>
             </div>
+          </div>
+        )}
+
+        {matchingRun?.warningMsg && !matchingRun.errorMsg && (
+          <div className="shrink-0 border-b border-neutral-100 px-5 py-3 dark:border-zinc-700/40">
+            <span className="text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">{t('runs.warningLabel')}</span>
+            <pre className="mt-1.5 whitespace-pre-wrap break-words rounded-lg border border-amber-200/60 bg-amber-50/60 p-3 text-xs leading-relaxed text-amber-800 dark:border-amber-800/40 dark:bg-amber-950/20 dark:text-amber-300">{matchingRun.warningMsg}</pre>
           </div>
         )}
 
